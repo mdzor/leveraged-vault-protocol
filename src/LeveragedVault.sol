@@ -169,7 +169,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         return userVaults[user];
     }
 
-
     function getAllVaults() external view returns (VaultInfo[] memory) {
         VaultInfo[] memory allVaults = new VaultInfo[](totalVaultsCreated);
         uint256 index = 0;
@@ -183,7 +182,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
 
         return allVaults;
     }
-
 
     function getTotalVaultsCreated() external view returns (uint256) {
         return totalVaultsCreated;

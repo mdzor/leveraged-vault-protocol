@@ -167,6 +167,19 @@ uint256[] memory userVaultIds = factory.getUserVaults(userAddress);
 - [Foundry](https://getfoundry.sh/) installed
 - Solidity ^0.8.20
 
+### Setup
+
+```shell
+# Clone the repository
+git clone <repo-url>
+cd leveraged-vault-protocol
+
+# Install git hooks (recommended)
+./scripts/setup-hooks.sh
+```
+
+**Git Hooks**: The setup script installs pre-push hooks that run `forge fmt`, `forge build`, and `forge test` before each push. This prevents pipeline failures by catching issues locally.
+
 ### Build
 
 ```shell

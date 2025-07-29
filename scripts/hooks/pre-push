@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Pre-push hook to run forge fmt, build, and test checks
+# This prevents pipeline failures by running the same checks locally
+
+set -e
+
+echo "🔨 Running pre-push checks..."
+
+# Run forge fmt check
+echo "📝 Checking code formatting..."
+if ! forge fmt --check; then
+    echo "❌ Code formatting check failed. Run 'forge fmt' to fix formatting issues."
+    exit 1
+fi
+echo "✅ Code formatting is correct"
+
+# Run forge build
+echo "🏗️  Building project..."
+if ! forge build --sizes; then
+    echo "❌ Build failed. Fix compilation errors before pushing."
+    exit 1
+fi
+echo "✅ Build successful"
+
+# Run forge tests
+echo "🧪 Running tests..."
+if ! forge test -vvv; then
+    echo "❌ Tests failed. Fix failing tests before pushing."
+    exit 1
+fi
+echo "✅ All tests passed"
+
+echo "🎉 All pre-push checks passed! Proceeding with push..."
