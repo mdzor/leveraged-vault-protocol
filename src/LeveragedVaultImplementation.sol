@@ -39,21 +39,49 @@ interface IPrimeBroker {
     );
 }
 
-interface IMorphoV2 {
-    // ERC4626 standard functions
-    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
-    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);
-    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
-    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+// Morpho Blue MarketParams struct
+struct MarketParams {
+    address loanToken;        // USDC (borrowed asset)
+    address collateralToken;  // Fund token (collateral asset)
+    address oracle;           // Price oracle
+    address irm;              // Interest rate model
+    uint256 lltv;             // Loan-to-value ratio
+}
+
+interface IMorpho {
+    function supplyCollateral(
+        MarketParams memory marketParams,
+        uint256 assets,
+        address onBehalf,
+        bytes memory data
+    ) external;
     
-    // ERC4626 view functions
-    function totalAssets() external view returns (uint256);
-    function convertToShares(uint256 assets) external view returns (uint256);
-    function convertToAssets(uint256 shares) external view returns (uint256);
-    function balanceOf(address account) external view returns (uint256);
+    function borrow(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        address receiver
+    ) external returns (uint256 assetsBorrowed, uint256 sharesBorrowed);
     
-    // Morpho V2 specific functions
-    function virtualShares() external view returns (uint256);
+    function repay(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256 shares,
+        address onBehalf,
+        bytes memory data
+    ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
+    
+    function withdrawCollateral(
+        MarketParams memory marketParams,
+        uint256 assets,
+        address onBehalf,
+        address receiver
+    ) external;
+    
+    // View functions for position tracking
+    function position(bytes32 id, address user) external view returns (uint256 supplyShares, uint256 borrowShares, uint256 collateral);
+    function market(bytes32 id) external view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint256 lastUpdate, uint128 fee);
 }
 
 interface IERC3643Fund {
@@ -130,9 +158,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     struct VaultConfig {
         IERC20 depositToken;           // USDC, USDT, etc.
         IPrimeBroker primeBroker;      // Lending protocol for leverage
-        IMorphoV2 morpho;              // Morpho v2 for collateral
+        IMorpho morpho;                // Morpho Blue for collateral
         IERC3643 syntheticToken;       // ERC3643 synthetic token contract
         address fundToken;             // The specific ERC3643 fund this vault targets
+        MarketParams morphoMarket;     // Morpho Blue market parameters
         uint256 managementFee;         // Annual fee in basis points
         uint256 performanceFee;        // Performance fee in basis points
         uint256 minLockPeriod;         // Minimum lock period in seconds
@@ -424,9 +453,17 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         vaultConfig.depositToken.approve(vaultConfig.fundToken, totalInvestAmount);
         uint256 fundTokensReceived = IERC3643Fund(vaultConfig.fundToken).invest(totalInvestAmount);
         
-        // Deposit fund tokens to Morpho V2 vault for yield
+        // Supply fund tokens as collateral to Morpho Blue
         IERC20(vaultConfig.fundToken).approve(address(vaultConfig.morpho), fundTokensReceived);
-        vaultConfig.morpho.deposit(fundTokensReceived, address(this));
+        vaultConfig.morpho.supplyCollateral(vaultConfig.morphoMarket, fundTokensReceived, address(this), "");
+        
+        // Borrow USDC from Morpho against the collateral
+        uint256 borrowAmount = position.approvedAmount;
+        vaultConfig.morpho.borrow(vaultConfig.morphoMarket, borrowAmount, 0, address(this), address(this));
+        
+        // Immediately repay Prime Broker to achieve zero debt (per spec requirement)
+        vaultConfig.depositToken.approve(address(vaultConfig.primeBroker), borrowAmount);
+        vaultConfig.primeBroker.repay(address(vaultConfig.depositToken), borrowAmount);
         
         // Mint synthetic tokens to user
         uint256 syntheticTokens = LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, position.leverageRatio);
@@ -491,32 +528,37 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         // Burn synthetic tokens from user
         vaultConfig.syntheticToken.burn(msg.sender, position.syntheticTokensMinted);
         
-        // Withdraw our fund tokens from Morpho (convert assets to shares first)
-        uint256 sharesToRedeem = vaultConfig.morpho.convertToShares(position.fundTokensOwned);
-        uint256 fundTokensWithdrawn = vaultConfig.morpho.redeem(sharesToRedeem, address(this), address(this));
-        
-        // Redeem fund tokens for underlying USDC
-        uint256 underlyingReceived = IERC3643Fund(position.fundToken).redeem(fundTokensWithdrawn);
-        
-        // Repay borrowed amount to Prime Broker
+        // First, withdraw some fund tokens from Morpho to get USDC for repayment
         uint256 repayAmount = position.borrowedAmount;
-        vaultConfig.depositToken.approve(address(vaultConfig.primeBroker), repayAmount);
-        vaultConfig.primeBroker.repay(address(vaultConfig.depositToken), repayAmount);
+        uint256 fundTokensToRedeem = _calculateFundTokensToRedeem(position.fundTokensOwned, repayAmount);
         
-        // Withdraw original collateral from Prime Broker
-        vaultConfig.primeBroker.withdraw(address(vaultConfig.depositToken), position.depositAmount);
+        // Withdraw the fund tokens we need to redeem from Morpho
+        vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, fundTokensToRedeem, address(this), address(this));
         
-        // Calculate net amount after repaying broker
-        uint256 netAmount = underlyingReceived > repayAmount ? 
-            underlyingReceived - repayAmount : 0;
+        // Redeem those fund tokens for USDC
+        uint256 underlyingReceived = IERC3643Fund(position.fundToken).redeem(fundTokensToRedeem);
+        
+        // Repay borrowed USDC to Morpho Blue
+        vaultConfig.depositToken.approve(address(vaultConfig.morpho), repayAmount);
+        vaultConfig.morpho.repay(vaultConfig.morphoMarket, repayAmount, 0, address(this), "");
+        
+        // Withdraw remaining fund tokens from Morpho as collateral
+        uint256 remainingCollateral = position.fundTokensOwned - fundTokensToRedeem;
+        vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, remainingCollateral, address(this), address(this));
+        
+        // Redeem remaining fund tokens for USDC
+        uint256 remainingUSDC = IERC3643Fund(position.fundToken).redeem(remainingCollateral);
+        
+        // Calculate total USDC available (remaining from repayment + remaining from collateral)
+        uint256 totalUSDCAvailable = (underlyingReceived - repayAmount) + remainingUSDC;
         
         // Calculate P&L (profit/loss vs original deposit)
-        uint256 pnl = netAmount > position.depositAmount ? 
-            netAmount - position.depositAmount : 0;
+        uint256 pnl = totalUSDCAvailable > position.depositAmount ? 
+            totalUSDCAvailable - position.depositAmount : 0;
         
         // Charge fees on profits
         uint256 fees = _calculateAndChargeFees(position, pnl);
-        uint256 finalAmount = netAmount - fees;
+        uint256 finalAmount = totalUSDCAvailable - fees;
         
         // Return funds to user
         if (finalAmount > 0) {
@@ -546,6 +588,17 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     // Internal helper functions
+
+    function _calculateFundTokensToRedeem(uint256 totalFundTokens, uint256 usdcNeeded) internal view returns (uint256) {
+        uint256 fundTokenPrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
+        uint256 fundTokensNeeded = (usdcNeeded * 1e18) / fundTokenPrice;
+        
+        // Add a small buffer (0.1%) to account for rounding and ensure we get enough USDC
+        fundTokensNeeded = (fundTokensNeeded * 1001) / 1000;
+        
+        // Ensure we don't try to redeem more than we have
+        return fundTokensNeeded > totalFundTokens ? totalFundTokens : fundTokensNeeded;
+    }
 
     function _calculateAndChargeFees(UserPosition memory position, uint256 pnl) internal returns (uint256 totalFees) {
         uint256 managementFee = 0;

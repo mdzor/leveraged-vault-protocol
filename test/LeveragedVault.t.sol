@@ -269,74 +269,92 @@ contract MockPrimeBroker is IPrimeBroker {
     bool public autoApprove = false;
 }
 
-contract MockMorphoV2 is IMorphoV2 {
-    mapping(address => uint256) private _balances;
-    uint256 private _totalSupply;
-    address public asset; // Can accept any ERC20 token
-    uint256 public sharePrice = 1e18; // 1:1 initially
+contract MockMorpho is IMorpho {
+    mapping(address => mapping(address => uint256)) private _collateralBalances; // user => token => amount
+    mapping(address => mapping(address => uint256)) private _borrowBalances; // user => token => amount
+    address public collateralAsset;
+    address public loanAsset;
 
-    constructor(address _asset) {
-        asset = _asset;
+    constructor(address _collateralAsset, address _loanAsset) {
+        collateralAsset = _collateralAsset;
+        loanAsset = _loanAsset;
     }
 
-    function deposit(uint256 assets, address receiver) external override returns (uint256 shares) {
-        // Transfer fund tokens from caller to this contract
-        IERC20(asset).transferFrom(msg.sender, address(this), assets);
-        shares = convertToShares(assets);
-        _balances[receiver] += shares;
-        _totalSupply += shares;
-        return shares;
+    function supplyCollateral(
+        MarketParams memory marketParams,
+        uint256 assets,
+        address onBehalf,
+        bytes memory
+    ) external override {
+        require(marketParams.collateralToken == collateralAsset, "Invalid collateral token");
+        IERC20(marketParams.collateralToken).transferFrom(msg.sender, address(this), assets);
+        _collateralBalances[onBehalf][marketParams.collateralToken] += assets;
+    }
+    
+    function borrow(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256,
+        address onBehalf,
+        address receiver
+    ) external override returns (uint256 assetsBorrowed, uint256 sharesBorrowed) {
+        require(marketParams.loanToken == loanAsset, "Invalid loan token");
+        require(_collateralBalances[onBehalf][marketParams.collateralToken] > 0, "No collateral");
+        
+        _borrowBalances[onBehalf][marketParams.loanToken] += assets;
+        IERC20(marketParams.loanToken).transfer(receiver, assets);
+        
+        return (assets, assets); // Simplified 1:1 conversion
+    }
+    
+    function repay(
+        MarketParams memory marketParams,
+        uint256 assets,
+        uint256,
+        address onBehalf,
+        bytes memory
+    ) external override returns (uint256 assetsRepaid, uint256 sharesRepaid) {
+        require(marketParams.loanToken == loanAsset, "Invalid loan token");
+        require(_borrowBalances[onBehalf][marketParams.loanToken] >= assets, "Repaying more than borrowed");
+        
+        IERC20(marketParams.loanToken).transferFrom(msg.sender, address(this), assets);
+        _borrowBalances[onBehalf][marketParams.loanToken] -= assets;
+        
+        return (assets, assets); // Simplified 1:1 conversion
+    }
+    
+    function withdrawCollateral(
+        MarketParams memory marketParams,
+        uint256 assets,
+        address onBehalf,
+        address receiver
+    ) external override {
+        require(marketParams.collateralToken == collateralAsset, "Invalid collateral token");
+        require(_collateralBalances[onBehalf][marketParams.collateralToken] >= assets, "Insufficient collateral");
+        
+        _collateralBalances[onBehalf][marketParams.collateralToken] -= assets;
+        IERC20(marketParams.collateralToken).transfer(receiver, assets);
+    }
+    
+    function position(bytes32, address user) external view override returns (uint256 supplyShares, uint256 borrowShares, uint256 collateral) {
+        return (0, _borrowBalances[user][loanAsset], _collateralBalances[user][collateralAsset]);
+    }
+    
+    function market(bytes32) external pure override returns (uint128, uint128, uint128, uint128, uint256, uint128) {
+        return (0, 0, 0, 0, 0, 0); // Simplified
     }
 
-    function withdraw(uint256 assets, address receiver, address owner) external override returns (uint256 shares) {
-        shares = convertToShares(assets);
-        require(_balances[owner] >= shares, "Insufficient balance");
-        _balances[owner] -= shares;
-        _totalSupply -= shares;
-        IERC20(asset).transfer(receiver, assets);
-        return shares;
+    // Helper functions for testing
+    function getCollateralBalance(address user) external view returns (uint256) {
+        return _collateralBalances[user][collateralAsset];
     }
-
-    function redeem(uint256 shares, address receiver, address owner) external override returns (uint256 assets) {
-        require(_balances[owner] >= shares, "Insufficient balance");
-        _balances[owner] -= shares;
-        _totalSupply -= shares;
-        assets = convertToAssets(shares);
-        IERC20(asset).transfer(receiver, assets);
-        return assets;
+    
+    function getBorrowBalance(address user) external view returns (uint256) {
+        return _borrowBalances[user][loanAsset];
     }
-
-    function mint(uint256 shares, address receiver) external override returns (uint256 assets) {
-        assets = convertToAssets(shares);
-        IERC20(asset).transferFrom(msg.sender, address(this), assets);
-        _balances[receiver] += shares;
-        _totalSupply += shares;
-        return assets;
-    }
-
-    function totalAssets() external view override returns (uint256) {
-        return IERC20(asset).balanceOf(address(this));
-    }
-
-    function convertToShares(uint256 assets) public view override returns (uint256) {
-        return (assets * 1e18) / sharePrice;
-    }
-
-    function convertToAssets(uint256 shares) public view override returns (uint256) {
-        return (shares * sharePrice) / 1e18;
-    }
-
-    function balanceOf(address account) external view override returns (uint256) {
-        return _balances[account];
-    }
-
-    function virtualShares() external view override returns (uint256) {
-        return _totalSupply;
-    }
-
-    // Helper to simulate vault performance
-    function setSharePrice(uint256 newPrice) external {
-        sharePrice = newPrice;
+    
+    function fundContract(uint256 amount) external {
+        MockERC20(loanAsset).mint(address(this), amount);
     }
 }
 
@@ -494,7 +512,7 @@ contract LeveragedVaultFactoryTest is Test {
     uint256 public testVaultId;
     MockERC20 public usdc;
     MockPrimeBroker public primeBroker;
-    MockMorphoV2 public morpho;
+    MockMorpho public morpho;
     MockERC3643Fund public fundToken;
     MockERC3643Token public syntheticToken;
     
@@ -516,7 +534,7 @@ contract LeveragedVaultFactoryTest is Test {
         // Deploy mock protocols
         primeBroker = new MockPrimeBroker(usdc);
         fundToken = new MockERC3643Fund(usdc);
-        morpho = new MockMorphoV2(address(fundToken)); // Morpho accepts fund tokens, not USDC
+        morpho = new MockMorpho(address(fundToken), address(usdc)); // Morpho: fundToken as collateral, USDC as loan asset
         
         // Fund the broker with liquidity
         primeBroker.fundBroker(BROKER_LIQUIDITY);
@@ -524,9 +542,21 @@ contract LeveragedVaultFactoryTest is Test {
         // Fund the fund contract
         fundToken.fundContract(1_000_000e6); // 1M USDC
         
+        // Fund Morpho with USDC for lending
+        morpho.fundContract(100_000_000e6); // 100M USDC
+        
         // Deploy factory
         factory = new LeveragedVaultFactory();
         
+        // Create Morpho market params
+        MarketParams memory morphoMarket = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: address(fundToken),
+            oracle: address(0), // Mock oracle
+            irm: address(0), // Mock IRM
+            lltv: 86e16 // 86% LTV
+        });
+
         // Create a test vault through factory
         LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
             depositToken: usdc,
@@ -534,6 +564,7 @@ contract LeveragedVaultFactoryTest is Test {
             morpho: morpho,
             syntheticToken: syntheticToken,
             fundToken: address(fundToken),
+            morphoMarket: morphoMarket,
             managementFee: 200, // 2% annual
             performanceFee: 2000, // 20% of profits
             minLockPeriod: 7 days,
@@ -796,12 +827,21 @@ contract LeveragedVaultFactoryTest is Test {
         MockERC3643Fund newFund = new MockERC3643Fund(usdc);
         MockERC3643Token newSyntheticToken = new MockERC3643Token();
         
+        MarketParams memory newMorphoMarket = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: address(newFund),
+            oracle: address(0), // Mock oracle
+            irm: address(0), // Mock IRM
+            lltv: 86e16 // 86% LTV
+        });
+        
         LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
             depositToken: usdc,
             primeBroker: primeBroker,
             morpho: morpho,
             syntheticToken: newSyntheticToken,
             fundToken: address(newFund),
+            morphoMarket: newMorphoMarket,
             managementFee: 300,
             performanceFee: 1500,
             minLockPeriod: 14 days,
@@ -885,12 +925,21 @@ contract LeveragedVaultFactoryTest is Test {
 
     function testConfigUpdates() public {
         // Create new config with all required fields
+        MarketParams memory updatedMarket = MarketParams({
+            loanToken: address(usdc),
+            collateralToken: address(fundToken),
+            oracle: address(0), // Mock oracle
+            irm: address(0), // Mock IRM
+            lltv: 80e16 // Changed to 80% LTV
+        });
+        
         LeveragedVaultImplementation.VaultConfig memory newConfig = LeveragedVaultImplementation.VaultConfig({
             depositToken: usdc,
             primeBroker: primeBroker,
             morpho: morpho,
             syntheticToken: syntheticToken,
             fundToken: address(fundToken),
+            morphoMarket: updatedMarket,
             managementFee: 300, // Changed to 3%
             performanceFee: 1500, // Changed to 15%
             minLockPeriod: 14 days, // Changed to 2 weeks
@@ -995,12 +1044,21 @@ contract LeveragedVaultFactoryTest is Test {
             MockERC3643Fund newFund = new MockERC3643Fund(usdc);
             MockERC3643Token newToken = new MockERC3643Token();
             
+            MarketParams memory newMarket = MarketParams({
+                loanToken: address(usdc),
+                collateralToken: address(newFund),
+                oracle: address(0), // Mock oracle
+                irm: address(0), // Mock IRM
+                lltv: 86e16 // 86% LTV
+            });
+            
             LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
                 depositToken: usdc,
                 primeBroker: primeBroker,
                 morpho: morpho,
                 syntheticToken: newToken,
                 fundToken: address(newFund),
+                morphoMarket: newMarket,
                 managementFee: 200 + (i * 100),
                 performanceFee: 2000,
                 minLockPeriod: 7 days,
