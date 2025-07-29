@@ -207,6 +207,25 @@ forge snapshot
 forge fmt
 ```
 
+### Deploy to Base Testnet
+
+```shell
+# Configure environment
+cp .env.example .env
+# Edit .env with your private key and Base testnet RPC
+
+# Deploy complete protocol with mocks
+forge script script/Deploy.s.sol --rpc-url base_testnet --broadcast --verify
+
+# Create and execute test position
+forge script script/Interact.s.sol --rpc-url base_testnet --broadcast
+
+# Check protocol status
+forge script script/Manage.s.sol --sig "getProtocolStatus()" --rpc-url base_testnet
+```
+
+📖 **See [DEPLOYMENT.md](DEPLOYMENT.md) for comprehensive deployment guide**
+
 ## Security Features
 
 ### Input Validation
