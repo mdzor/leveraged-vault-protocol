@@ -13,19 +13,16 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
     address public identityRegistry;
     address public compliance;
     mapping(address => bool) public verified;
-    
+
     event UserVerified(address indexed user);
     event UserUnverified(address indexed user);
-    
-    constructor(
-        string memory name,
-        string memory symbol
-    ) ERC20(name, symbol) Ownable(msg.sender) {
+
+    constructor(string memory name, string memory symbol) ERC20(name, symbol) Ownable(msg.sender) {
         // Set deployer as identity registry and compliance for simplicity
         identityRegistry = msg.sender;
         compliance = msg.sender;
     }
-    
+
     /**
      * @dev Mint tokens (only owner/vault can call)
      */
@@ -33,35 +30,21 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
         require(isVerified(to), "Recipient not verified");
         _mint(to, amount);
     }
-    
+
     /**
      * @dev Burn tokens (only owner/vault can call)
      */
     function burn(address from, uint256 amount) external override onlyOwner {
         _burn(from, amount);
     }
-    
+
     /**
      * @dev Check if address is verified for ERC3643 compliance
      */
     function isVerified(address account) public view override returns (bool) {
         return verified[account];
     }
-    
-    /**
-     * @dev Get identity registry address
-     */
-    function identityRegistry() external view override returns (address) {
-        return identityRegistry;
-    }
-    
-    /**
-     * @dev Get compliance contract address
-     */
-    function compliance() external view override returns (address) {
-        return compliance;
-    }
-    
+
     /**
      * @dev Admin function to verify users (simulate KYC)
      */
@@ -69,7 +52,7 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
         verified[user] = true;
         emit UserVerified(user);
     }
-    
+
     /**
      * @dev Admin function to unverify users
      */
@@ -77,7 +60,7 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
         verified[user] = false;
         emit UserUnverified(user);
     }
-    
+
     /**
      * @dev Batch verify users for easier testing
      */
@@ -87,7 +70,7 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
             emit UserVerified(users[i]);
         }
     }
-    
+
     /**
      * @dev Override transfer to check compliance
      */
@@ -96,13 +79,31 @@ contract MockERC3643Token is ERC20, Ownable, IERC3643 {
         require(isVerified(to), "Recipient not verified");
         return super.transfer(to, amount);
     }
-    
+
     /**
      * @dev Override transferFrom to check compliance
      */
-    function transferFrom(address from, address to, uint256 amount) public override(ERC20, IERC3643) returns (bool) {
+    function transferFrom(address from, address to, uint256 amount)
+        public
+        override(ERC20, IERC3643)
+        returns (bool)
+    {
         require(isVerified(from), "Sender not verified");
         require(isVerified(to), "Recipient not verified");
         return super.transferFrom(from, to, amount);
+    }
+
+    /**
+     * @dev Override balanceOf to satisfy both ERC20 and IERC3643
+     */
+    function balanceOf(address account) public view override(ERC20, IERC3643) returns (uint256) {
+        return super.balanceOf(account);
+    }
+
+    /**
+     * @dev Override totalSupply to satisfy both ERC20 and IERC3643
+     */
+    function totalSupply() public view override(ERC20, IERC3643) returns (uint256) {
+        return super.totalSupply();
     }
 }
