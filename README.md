@@ -175,7 +175,7 @@ git clone <repo-url>
 cd leveraged-vault-protocol
 
 # Install git hooks (recommended)
-./scripts/setup-hooks.sh
+./script/setup-hooks.sh
 ```
 
 **Git Hooks**: The setup script installs pre-push hooks that run `forge fmt`, `forge build`, and `forge test` before each push. This prevents pipeline failures by catching issues locally.

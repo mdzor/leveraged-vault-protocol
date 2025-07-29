@@ -15,7 +15,7 @@ fi
 
 # Copy hooks to .git/hooks directory
 echo "📋 Installing pre-push hook..."
-cp scripts/hooks/pre-push .git/hooks/pre-push
+cp script/hooks/pre-push .git/hooks/pre-push
 chmod +x .git/hooks/pre-push
 
 echo "✅ Git hooks installed successfully!"
