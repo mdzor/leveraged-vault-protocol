@@ -7,104 +7,11 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./libraries/LeverageCalculator.sol";
+import "./interfaces/IPrimeBroker.sol";
+import "./interfaces/IMorpho.sol";
+import "./interfaces/IERC3643.sol";
+import "./interfaces/IERC3643Fund.sol";
 
-// Interfaces
-interface IPrimeBroker {
-    // Legacy synchronous functions (kept for repayment/withdrawal)
-    function supply(address asset, uint256 amount) external;
-    function borrow(address asset, uint256 amount) external;  // Re-added for execution phase
-    function repay(address asset, uint256 amount) external;
-    function withdraw(address asset, uint256 amount) external;
-    function getHealthFactor(address user) external view returns (uint256);
-    function getAvailableBorrow(address user, address asset) external view returns (uint256);
-    
-    // New async leverage functions
-    function requestLeverage(
-        address user, 
-        address asset, 
-        uint256 collateralAmount,
-        uint256 leverageAmount,
-        uint256 leverageRatio
-    ) external returns (bytes32 requestId);
-    
-    // Callback functions (only broker can call these on vault)
-    function isValidRequest(bytes32 requestId) external view returns (bool);
-    function getRequestDetails(bytes32 requestId) external view returns (
-        address user,
-        address asset,
-        uint256 collateralAmount,
-        uint256 leverageAmount,
-        uint256 requestTimestamp,
-        bool isProcessed
-    );
-}
-
-// Morpho Blue MarketParams struct
-struct MarketParams {
-    address loanToken;        // USDC (borrowed asset)
-    address collateralToken;  // Fund token (collateral asset)
-    address oracle;           // Price oracle
-    address irm;              // Interest rate model
-    uint256 lltv;             // Loan-to-value ratio
-}
-
-interface IMorpho {
-    function supplyCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalf,
-        bytes memory data
-    ) external;
-    
-    function borrow(
-        MarketParams memory marketParams,
-        uint256 assets,
-        uint256 shares,
-        address onBehalf,
-        address receiver
-    ) external returns (uint256 assetsBorrowed, uint256 sharesBorrowed);
-    
-    function repay(
-        MarketParams memory marketParams,
-        uint256 assets,
-        uint256 shares,
-        address onBehalf,
-        bytes memory data
-    ) external returns (uint256 assetsRepaid, uint256 sharesRepaid);
-    
-    function withdrawCollateral(
-        MarketParams memory marketParams,
-        uint256 assets,
-        address onBehalf,
-        address receiver
-    ) external;
-    
-    // View functions for position tracking
-    function position(bytes32 id, address user) external view returns (uint256 supplyShares, uint256 borrowShares, uint256 collateral);
-    function market(bytes32 id) external view returns (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint256 lastUpdate, uint128 fee);
-}
-
-interface IERC3643Fund {
-    function invest(uint256 amount) external returns (uint256 shares);
-    function redeem(uint256 shares) external returns (uint256 amount);
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function getSharePrice() external view returns (uint256);
-    function totalAssets() external view returns (uint256);
-    function totalSupply() external view returns (uint256);
-}
-
-interface IERC3643 {
-    function mint(address to, uint256 amount) external;
-    function burn(address from, uint256 amount) external;
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function totalSupply() external view returns (uint256);
-    function isVerified(address account) external view returns (bool);
-    function identityRegistry() external view returns (address);
-    function compliance() external view returns (address);
-}
 
 /**
  * @title LeveragedVaultImplementation
@@ -144,7 +51,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         uint256 borrowedAmount;         // Total debt to Prime Broker
         uint256 lockUntil;             // Position lock timestamp
         uint256 entryTimestamp;        // When position was opened
-        bool isActive;                 // Legacy field, will be replaced by state
         
         // New async broker fields
         PositionState state;           // Current position state
@@ -290,6 +196,18 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
      * @param _owner Owner of the vault
      */
     function initialize(VaultConfig memory _config, address _owner) external onlyFactory {
+        require(_owner != address(0), "Owner cannot be zero address");
+        require(address(_config.depositToken) != address(0), "Deposit token cannot be zero address");
+        require(address(_config.primeBroker) != address(0), "Prime broker cannot be zero address");
+        require(address(_config.morpho) != address(0), "Morpho cannot be zero address");
+        require(address(_config.syntheticToken) != address(0), "Synthetic token cannot be zero address");
+        require(_config.fundToken != address(0), "Fund token cannot be zero address");
+        require(_config.feeRecipient != address(0), "Fee recipient cannot be zero address");
+        require(_config.maxLeverage >= MIN_LEVERAGE && _config.maxLeverage <= MAX_LEVERAGE, "Invalid max leverage");
+        require(_config.managementFee <= BASIS_POINTS, "Management fee too high");
+        require(_config.performanceFee <= BASIS_POINTS, "Performance fee too high");
+        require(_config.minLockPeriod > 0, "Lock period must be positive");
+        
         vaultConfig = _config;
         _transferOwnership(_owner);
     }
@@ -311,6 +229,11 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         returns (uint256 positionId) 
     {
         require(amount > 0, "Amount must be greater than 0");
+        require(msg.sender != address(0), "Invalid sender");
+        
+        // Check user has sufficient balance
+        require(vaultConfig.depositToken.balanceOf(msg.sender) >= amount, "Insufficient balance");
+        require(vaultConfig.depositToken.allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
         
         // Transfer deposit from user (held in vault until broker approval)
         vaultConfig.depositToken.safeTransferFrom(msg.sender, address(this), amount);
@@ -345,7 +268,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             borrowedAmount: 0, // Will be set after broker approval
             lockUntil: 0, // Will be set after execution
             entryTimestamp: block.timestamp,
-            isActive: false, // Legacy field, using state instead
             
             // Async broker fields
             state: PositionState.Pending,
@@ -380,6 +302,9 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         external 
         onlyBroker 
     {
+        require(brokerRequestId != bytes32(0), "Invalid request ID");
+        require(approvedAmount > 0, "Approved amount must be positive");
+        
         uint256 positionId = requestIdToPosition[brokerRequestId];
         require(positionId != 0, "Invalid broker request ID");
         
@@ -408,6 +333,9 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         external 
         onlyBroker 
     {
+        require(brokerRequestId != bytes32(0), "Invalid request ID");
+        require(bytes(reason).length > 0, "Reason cannot be empty");
+        
         uint256 positionId = requestIdToPosition[brokerRequestId];
         require(positionId != 0, "Invalid broker request ID");
         
@@ -444,30 +372,60 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         // We need to get the leverage funds and invest the total amount
         
         // Get leverage funds from broker (broker provides the leverage)
-        vaultConfig.primeBroker.borrow(address(vaultConfig.depositToken), position.approvedAmount);
+        try vaultConfig.primeBroker.borrow(address(vaultConfig.depositToken), position.approvedAmount) {
+            // Success - continue
+        } catch {
+            revert("Failed to borrow from prime broker");
+        }
         
         // Now vault has: original deposit + leverage funds
         uint256 totalInvestAmount = position.depositAmount + position.approvedAmount;
         
-        // Invest in fund
+        // Get expected fund tokens for slippage protection
+        uint256 expectedFundTokens = _getExpectedFundTokens(totalInvestAmount);
+        uint256 minFundTokens = (expectedFundTokens * 9950) / 10000; // 0.5% slippage tolerance
+        
+        // Invest in fund with slippage protection
         vaultConfig.depositToken.approve(vaultConfig.fundToken, totalInvestAmount);
-        uint256 fundTokensReceived = IERC3643Fund(vaultConfig.fundToken).invest(totalInvestAmount);
+        uint256 fundTokensReceived;
+        try IERC3643Fund(vaultConfig.fundToken).invest(totalInvestAmount) returns (uint256 tokens) {
+            fundTokensReceived = tokens;
+            require(fundTokensReceived >= minFundTokens, "Slippage: insufficient fund tokens received");
+        } catch {
+            revert("Failed to invest in fund");
+        }
         
         // Supply fund tokens as collateral to Morpho Blue
         IERC20(vaultConfig.fundToken).approve(address(vaultConfig.morpho), fundTokensReceived);
-        vaultConfig.morpho.supplyCollateral(vaultConfig.morphoMarket, fundTokensReceived, address(this), "");
+        try vaultConfig.morpho.supplyCollateral(vaultConfig.morphoMarket, fundTokensReceived, address(this), "") {
+            // Success - continue
+        } catch {
+            revert("Failed to supply collateral to Morpho");
+        }
         
         // Borrow USDC from Morpho against the collateral
         uint256 borrowAmount = position.approvedAmount;
-        vaultConfig.morpho.borrow(vaultConfig.morphoMarket, borrowAmount, 0, address(this), address(this));
+        try vaultConfig.morpho.borrow(vaultConfig.morphoMarket, borrowAmount, 0, address(this), address(this)) {
+            // Success - continue
+        } catch {
+            revert("Failed to borrow from Morpho");
+        }
         
         // Immediately repay Prime Broker to achieve zero debt (per spec requirement)
         vaultConfig.depositToken.approve(address(vaultConfig.primeBroker), borrowAmount);
-        vaultConfig.primeBroker.repay(address(vaultConfig.depositToken), borrowAmount);
+        try vaultConfig.primeBroker.repay(address(vaultConfig.depositToken), borrowAmount) {
+            // Success - continue
+        } catch {
+            revert("Failed to repay prime broker");
+        }
         
         // Mint synthetic tokens to user
         uint256 syntheticTokens = LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, position.leverageRatio);
-        vaultConfig.syntheticToken.mint(position.user, syntheticTokens);
+        try vaultConfig.syntheticToken.mint(position.user, syntheticTokens) {
+            // Success - continue
+        } catch {
+            revert("Failed to mint synthetic tokens");
+        }
         
         // Update position state
         PositionState oldState = position.state;
@@ -476,7 +434,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         position.fundTokensOwned = fundTokensReceived; // Track fund tokens, not Morpho shares
         position.syntheticTokensMinted = syntheticTokens;
         position.lockUntil = block.timestamp + vaultConfig.minLockPeriod;
-        position.isActive = true; // Set legacy field for compatibility
         
         // Update vault totals
         totalValueLocked += totalInvestAmount;
@@ -526,28 +483,64 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         require(block.timestamp >= position.lockUntil, "Position still locked");
         
         // Burn synthetic tokens from user
-        vaultConfig.syntheticToken.burn(msg.sender, position.syntheticTokensMinted);
+        try vaultConfig.syntheticToken.burn(msg.sender, position.syntheticTokensMinted) {
+            // Success - continue
+        } catch {
+            revert("Failed to burn synthetic tokens");
+        }
         
         // First, withdraw some fund tokens from Morpho to get USDC for repayment
         uint256 repayAmount = position.borrowedAmount;
         uint256 fundTokensToRedeem = _calculateFundTokensToRedeem(position.fundTokensOwned, repayAmount);
         
         // Withdraw the fund tokens we need to redeem from Morpho
-        vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, fundTokensToRedeem, address(this), address(this));
+        try vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, fundTokensToRedeem, address(this), address(this)) {
+            // Success - continue
+        } catch {
+            revert("Failed to withdraw collateral from Morpho");
+        }
         
-        // Redeem those fund tokens for USDC
-        uint256 underlyingReceived = IERC3643Fund(position.fundToken).redeem(fundTokensToRedeem);
+        // Calculate minimum USDC expected for slippage protection
+        uint256 expectedUSDC = _getExpectedUSDCFromFundTokens(fundTokensToRedeem);
+        uint256 minUSDCFromRedeem = (expectedUSDC * 9950) / 10000; // 0.5% slippage tolerance
+        
+        // Redeem those fund tokens for USDC with slippage protection
+        uint256 underlyingReceived;
+        try IERC3643Fund(position.fundToken).redeem(fundTokensToRedeem) returns (uint256 amount) {
+            underlyingReceived = amount;
+            require(underlyingReceived >= minUSDCFromRedeem, "Slippage: insufficient USDC from redemption");
+        } catch {
+            revert("Failed to redeem fund tokens");
+        }
         
         // Repay borrowed USDC to Morpho Blue
         vaultConfig.depositToken.approve(address(vaultConfig.morpho), repayAmount);
-        vaultConfig.morpho.repay(vaultConfig.morphoMarket, repayAmount, 0, address(this), "");
+        try vaultConfig.morpho.repay(vaultConfig.morphoMarket, repayAmount, 0, address(this), "") {
+            // Success - continue
+        } catch {
+            revert("Failed to repay Morpho loan");
+        }
         
         // Withdraw remaining fund tokens from Morpho as collateral
         uint256 remainingCollateral = position.fundTokensOwned - fundTokensToRedeem;
-        vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, remainingCollateral, address(this), address(this));
+        try vaultConfig.morpho.withdrawCollateral(vaultConfig.morphoMarket, remainingCollateral, address(this), address(this)) {
+            // Success - continue
+        } catch {
+            revert("Failed to withdraw remaining collateral from Morpho");
+        }
         
-        // Redeem remaining fund tokens for USDC
-        uint256 remainingUSDC = IERC3643Fund(position.fundToken).redeem(remainingCollateral);
+        // Calculate minimum USDC expected for remaining redemption
+        uint256 expectedRemainingUSDC = _getExpectedUSDCFromFundTokens(remainingCollateral);
+        uint256 minRemainingUSDC = (expectedRemainingUSDC * 9950) / 10000; // 0.5% slippage tolerance
+        
+        // Redeem remaining fund tokens for USDC with slippage protection
+        uint256 remainingUSDC;
+        try IERC3643Fund(position.fundToken).redeem(remainingCollateral) returns (uint256 amount) {
+            remainingUSDC = amount;
+            require(remainingUSDC >= minRemainingUSDC, "Slippage: insufficient USDC from final redemption");
+        } catch {
+            revert("Failed to redeem remaining fund tokens");
+        }
         
         // Calculate total USDC available (remaining from repayment + remaining from collateral)
         uint256 totalUSDCAvailable = (underlyingReceived - repayAmount) + remainingUSDC;
@@ -568,7 +561,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         // Update position state to completed
         PositionState oldState = position.state;
         position.state = PositionState.Completed;
-        position.isActive = false; // Set legacy field
         
         // Update vault totals
         totalValueLocked -= (position.depositAmount + position.borrowedAmount);
@@ -583,11 +575,32 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
      * @param newConfig New vault configuration
      */
     function updateVaultConfig(VaultConfig memory newConfig) external onlyOwner {
+        require(address(newConfig.depositToken) != address(0), "Deposit token cannot be zero address");
+        require(address(newConfig.primeBroker) != address(0), "Prime broker cannot be zero address");
+        require(address(newConfig.morpho) != address(0), "Morpho cannot be zero address");
+        require(address(newConfig.syntheticToken) != address(0), "Synthetic token cannot be zero address");
+        require(newConfig.fundToken != address(0), "Fund token cannot be zero address");
+        require(newConfig.feeRecipient != address(0), "Fee recipient cannot be zero address");
+        require(newConfig.maxLeverage >= MIN_LEVERAGE && newConfig.maxLeverage <= MAX_LEVERAGE, "Invalid max leverage");
+        require(newConfig.managementFee <= BASIS_POINTS, "Management fee too high");
+        require(newConfig.performanceFee <= BASIS_POINTS, "Performance fee too high");
+        require(newConfig.minLockPeriod > 0, "Lock period must be positive");
+        
         vaultConfig = newConfig;
         emit ConfigUpdated(newConfig);
     }
 
     // Internal helper functions
+
+    function _getExpectedFundTokens(uint256 usdcAmount) internal view returns (uint256) {
+        uint256 sharePrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
+        return (usdcAmount * 1e18) / sharePrice;
+    }
+    
+    function _getExpectedUSDCFromFundTokens(uint256 fundTokens) internal view returns (uint256) {
+        uint256 sharePrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
+        return (fundTokens * sharePrice) / 1e18;
+    }
 
     function _calculateFundTokensToRedeem(uint256 totalFundTokens, uint256 usdcNeeded) internal view returns (uint256) {
         uint256 fundTokenPrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
@@ -638,7 +651,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
 
     function getPositionValue(uint256 positionId) external view returns (uint256 currentValue, int256 pnl) {
         UserPosition memory position = positions[positionId];
-        if (!position.isActive) return (0, 0);
+        if (position.state != PositionState.Executed) return (0, 0);
         
         // Get current fund token price
         uint256 currentPrice = IERC3643Fund(position.fundToken).getSharePrice();

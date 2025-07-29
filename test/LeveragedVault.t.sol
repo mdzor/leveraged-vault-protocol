@@ -686,8 +686,8 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 positionId2 = openPositionHelper(alice, 8_000e6, 300);
         
         // Check both positions are executed (active)
-        assertTrue(testVault.getPosition(positionId1).isActive);
-        assertTrue(testVault.getPosition(positionId2).isActive);
+        assertEq(uint256(testVault.getPosition(positionId1).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
+        assertEq(uint256(testVault.getPosition(positionId2).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
         
         // Check both positions have Executed state
         assertEq(uint256(testVault.getPosition(positionId1).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
@@ -720,7 +720,7 @@ contract LeveragedVaultFactoryTest is Test {
         testVault.closePosition(positionId);
         
         // Check position is closed
-        assertFalse(testVault.getPosition(positionId).isActive);
+        assertEq(uint256(testVault.getPosition(positionId).state), uint256(LeveragedVaultImplementation.PositionState.Completed));
         
         // Check alice got her money back (may be more or less due to fund performance)
         uint256 aliceBalanceAfter = usdc.balanceOf(alice);
@@ -1014,7 +1014,7 @@ contract LeveragedVaultFactoryTest is Test {
         
         // Verify all positions are executed
         for (uint i = 0; i < 10; i++) {
-            assertTrue(testVault.getPosition(positionIds[i]).isActive);
+            assertEq(uint256(testVault.getPosition(positionIds[i]).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
             assertEq(uint256(testVault.getPosition(positionIds[i]).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
         }
         
