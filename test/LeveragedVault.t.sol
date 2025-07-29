@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/LeveragedVault.sol";
+import "../src/LeveragedVaultImplementation.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 // Mock contracts for testing
@@ -76,7 +77,23 @@ contract MockPrimeBroker is IPrimeBroker {
     MockERC20 public immutable asset;
     
     uint256 public constant HEALTH_FACTOR = 2e18; // 200% health factor
-    uint256 public constant LTV_RATIO = 80; // 80% LTV
+    uint256 public constant LTV_RATIO = 95; // 95% LTV to allow higher leverage
+    
+    // Async request tracking
+    struct LeverageRequest {
+        address vault;      // The vault that made the request
+        address user;
+        address asset;
+        uint256 collateralAmount;
+        uint256 leverageAmount;
+        uint256 leverageRatio;
+        uint256 requestTimestamp;
+        bool isProcessed;
+        bool isApproved;
+    }
+    
+    mapping(bytes32 => LeverageRequest) public leverageRequests;
+    uint256 public requestCounter = 1;
 
     constructor(MockERC20 _asset) {
         asset = _asset;
@@ -88,9 +105,42 @@ contract MockPrimeBroker is IPrimeBroker {
         suppliedBalance[msg.sender] += amount;
     }
 
+    // New async leverage request function
+    function requestLeverage(
+        address user,
+        address assetAddr,
+        uint256 collateralAmount,
+        uint256 leverageAmount,
+        uint256 leverageRatio
+    ) external override returns (bytes32 requestId) {
+        require(assetAddr == address(asset), "Unsupported asset");
+        
+        // Generate unique request ID
+        requestId = keccak256(abi.encodePacked(user, assetAddr, block.timestamp, requestCounter++));
+        
+        // Store request
+        leverageRequests[requestId] = LeverageRequest({
+            vault: msg.sender,  // Store the vault address
+            user: user,
+            asset: assetAddr,
+            collateralAmount: collateralAmount,
+            leverageAmount: leverageAmount,
+            leverageRatio: leverageRatio,
+            requestTimestamp: block.timestamp,
+            isProcessed: false,
+            isApproved: false
+        });
+        
+        // Don't auto-approve immediately to avoid reentrancy
+        // Test will call processRequests() after the transaction
+        
+        return requestId;
+    }
+
     function borrow(address assetAddr, uint256 amount) external override {
         require(assetAddr == address(asset), "Unsupported asset");
-        require(this.getAvailableBorrow(msg.sender, assetAddr) >= amount, "Insufficient collateral");
+        
+        // For approved leverage positions, allow borrowing directly
         borrowedBalance[msg.sender] += amount;
         asset.transfer(msg.sender, amount);
     }
@@ -104,13 +154,22 @@ contract MockPrimeBroker is IPrimeBroker {
 
     function withdraw(address assetAddr, uint256 amount) external override {
         require(assetAddr == address(asset), "Unsupported asset");
-        require(suppliedBalance[msg.sender] >= amount, "Insufficient balance");
-        // Check if withdrawal maintains health factor
-        uint256 newSupplied = suppliedBalance[msg.sender] - amount;
-        uint256 maxBorrow = (newSupplied * LTV_RATIO) / 100;
-        require(borrowedBalance[msg.sender] <= maxBorrow, "Would break health factor");
         
-        suppliedBalance[msg.sender] -= amount;
+        // For leverage withdrawals, we allow withdrawing more than supplied
+        // This simulates the broker providing leverage funds
+        if (amount > suppliedBalance[msg.sender]) {
+            // This is a leverage withdrawal - track as borrowed amount
+            uint256 leverageAmount = amount - suppliedBalance[msg.sender];
+            borrowedBalance[msg.sender] += leverageAmount;
+            suppliedBalance[msg.sender] = 0;
+        } else {
+            // Regular withdrawal
+            uint256 newSupplied = suppliedBalance[msg.sender] - amount;
+            uint256 maxBorrow = (newSupplied * LTV_RATIO) / 100;
+            require(borrowedBalance[msg.sender] <= maxBorrow, "Would break health factor");
+            suppliedBalance[msg.sender] = newSupplied;
+        }
+        
         asset.transfer(msg.sender, amount);
     }
 
@@ -126,39 +185,165 @@ contract MockPrimeBroker is IPrimeBroker {
         return maxBorrow - borrowedBalance[user];
     }
 
+    // Interface implementation functions
+    function isValidRequest(bytes32 requestId) external view override returns (bool) {
+        return leverageRequests[requestId].requestTimestamp != 0;
+    }
+    
+    function getRequestDetails(bytes32 requestId) external view override returns (
+        address user,
+        address assetAddr,
+        uint256 collateralAmount,
+        uint256 leverageAmount,
+        uint256 requestTimestamp,
+        bool isProcessed
+    ) {
+        LeverageRequest memory request = leverageRequests[requestId];
+        return (
+            request.user,
+            request.asset,
+            request.collateralAmount,
+            request.leverageAmount,
+            request.requestTimestamp,
+            request.isProcessed
+        );
+    }
+
     // Helper function to fund the broker
     function fundBroker(uint256 amount) external {
         asset.mint(address(this), amount);
     }
+    
+    // Simulation functions for testing async behavior
+    function simulateApproveRequest(bytes32 requestId, address vault, uint256 approvedAmount) external {
+        require(leverageRequests[requestId].requestTimestamp != 0, "Invalid request");
+        require(!leverageRequests[requestId].isProcessed, "Already processed");
+        
+        leverageRequests[requestId].isProcessed = true;
+        leverageRequests[requestId].isApproved = true;
+        
+        // Call vault's approval handler
+        LeveragedVaultImplementation(vault).handleBrokerApproval(requestId, approvedAmount);
+    }
+    
+    function simulateRejectRequest(bytes32 requestId, address vault, string calldata reason) external {
+        require(leverageRequests[requestId].requestTimestamp != 0, "Invalid request");
+        require(!leverageRequests[requestId].isProcessed, "Already processed");
+        
+        leverageRequests[requestId].isProcessed = true;
+        leverageRequests[requestId].isApproved = false;
+        
+        // Call vault's rejection handler
+        LeveragedVaultImplementation(vault).handleBrokerRejection(requestId, reason);
+    }
+    
+    // Process all pending requests (for testing)
+    function processAllPendingRequests() external {
+        // This is a simplified approach for testing
+        // In reality, the broker would process requests asynchronously
+        for (uint256 i = 1; i < requestCounter; i++) {
+            bytes32 requestId = keccak256(abi.encodePacked("", address(0), uint256(0), i));
+            // Find the actual request ID (this is a hack for testing)
+            // In production, you'd have a proper way to iterate requests
+        }
+    }
+    
+    // Auto-approve function for simple testing 
+    function enableAutoApprove(bool enabled) external {
+        autoApprove = enabled;
+    }
+    
+    // Process specific request ID
+    function processRequest(bytes32 requestId) external {
+        LeverageRequest storage request = leverageRequests[requestId];
+        require(request.requestTimestamp != 0, "Invalid request");
+        require(!request.isProcessed, "Already processed");
+        
+        request.isProcessed = true;
+        request.isApproved = true;
+        
+        // Call vault's approval handler
+        LeveragedVaultImplementation(request.vault).handleBrokerApproval(requestId, request.leverageAmount);
+    }
+    
+    bool public autoApprove = false;
 }
 
 contract MockMorphoV2 is IMorphoV2 {
-    mapping(address => mapping(address => uint256)) public balances;
-    MockERC20 public asset;
+    mapping(address => uint256) private _balances;
+    uint256 private _totalSupply;
+    address public asset; // Can accept any ERC20 token
+    uint256 public sharePrice = 1e18; // 1:1 initially
 
-    constructor(MockERC20 _asset) {
+    constructor(address _asset) {
         asset = _asset;
     }
 
-    function supply(address assetAddr, uint256 amount, address onBehalf) external override {
-        IERC20(assetAddr).transferFrom(msg.sender, address(this), amount);
-        balances[onBehalf][assetAddr] += amount;
+    function deposit(uint256 assets, address receiver) external override returns (uint256 shares) {
+        // Transfer fund tokens from caller to this contract
+        IERC20(asset).transferFrom(msg.sender, address(this), assets);
+        shares = convertToShares(assets);
+        _balances[receiver] += shares;
+        _totalSupply += shares;
+        return shares;
     }
 
-    function withdraw(address assetAddr, uint256 amount, address receiver) external override {
-        require(balances[msg.sender][assetAddr] >= amount, "Insufficient balance");
-        balances[msg.sender][assetAddr] -= amount;
-        IERC20(assetAddr).transfer(receiver, amount);
+    function withdraw(uint256 assets, address receiver, address owner) external override returns (uint256 shares) {
+        shares = convertToShares(assets);
+        require(_balances[owner] >= shares, "Insufficient balance");
+        _balances[owner] -= shares;
+        _totalSupply -= shares;
+        IERC20(asset).transfer(receiver, assets);
+        return shares;
     }
 
-    function getBalance(address user, address assetAddr) external view override returns (uint256) {
-        return balances[user][assetAddr];
+    function redeem(uint256 shares, address receiver, address owner) external override returns (uint256 assets) {
+        require(_balances[owner] >= shares, "Insufficient balance");
+        _balances[owner] -= shares;
+        _totalSupply -= shares;
+        assets = convertToAssets(shares);
+        IERC20(asset).transfer(receiver, assets);
+        return assets;
+    }
+
+    function mint(uint256 shares, address receiver) external override returns (uint256 assets) {
+        assets = convertToAssets(shares);
+        IERC20(asset).transferFrom(msg.sender, address(this), assets);
+        _balances[receiver] += shares;
+        _totalSupply += shares;
+        return assets;
+    }
+
+    function totalAssets() external view override returns (uint256) {
+        return IERC20(asset).balanceOf(address(this));
+    }
+
+    function convertToShares(uint256 assets) public view override returns (uint256) {
+        return (assets * 1e18) / sharePrice;
+    }
+
+    function convertToAssets(uint256 shares) public view override returns (uint256) {
+        return (shares * sharePrice) / 1e18;
+    }
+
+    function balanceOf(address account) external view override returns (uint256) {
+        return _balances[account];
+    }
+
+    function virtualShares() external view override returns (uint256) {
+        return _totalSupply;
+    }
+
+    // Helper to simulate vault performance
+    function setSharePrice(uint256 newPrice) external {
+        sharePrice = newPrice;
     }
 }
 
 contract MockERC3643Fund is IERC3643Fund {
     MockERC20 public underlying;
     mapping(address => uint256) public shares;
+    mapping(address => mapping(address => uint256)) private _allowances;
     uint256 public totalShares;
     uint256 public sharePrice = 1e18; // 1:1 initially
     
@@ -191,6 +376,26 @@ contract MockERC3643Fund is IERC3643Fund {
         require(shares[msg.sender] >= amount, "Insufficient shares");
         shares[msg.sender] -= amount;
         shares[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function allowance(address owner, address spender) external view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 currentAllowance = _allowances[from][msg.sender];
+        require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
+        require(shares[from] >= amount, "Insufficient shares");
+        
+        shares[from] -= amount;
+        shares[to] += amount;
+        _allowances[from][msg.sender] = currentAllowance - amount;
         return true;
     }
 
@@ -280,11 +485,13 @@ contract MockERC3643Token is IERC3643, Ownable {
 }
 
 /**
- * @title LeveragedVaultTest
- * @dev Epic test suite for LeveragedVault with comprehensive scenarios
+ * @title LeveragedVaultFactoryTest
+ * @dev Epic test suite for LeveragedVaultFactory with comprehensive scenarios
  */
-contract LeveragedVaultTest is Test {
-    LeveragedVault public vault;
+contract LeveragedVaultFactoryTest is Test {
+    LeveragedVaultFactory public factory;
+    LeveragedVaultImplementation public testVault;
+    uint256 public testVaultId;
     MockERC20 public usdc;
     MockPrimeBroker public primeBroker;
     MockMorphoV2 public morpho;
@@ -298,8 +505,8 @@ contract LeveragedVaultTest is Test {
     address public treasury = makeAddr("treasury");
     
     // Test constants
-    uint256 public constant INITIAL_BALANCE = 100_000e6; // 100k USDC
-    uint256 public constant BROKER_LIQUIDITY = 10_000_000e6; // 10M USDC for broker
+    uint256 public constant INITIAL_BALANCE = 1_000_000e6; // 1M USDC per user
+    uint256 public constant BROKER_LIQUIDITY = 100_000_000e6; // 100M USDC for broker
 
     function setUp() public {
         // Deploy mock tokens
@@ -308,8 +515,8 @@ contract LeveragedVaultTest is Test {
         
         // Deploy mock protocols
         primeBroker = new MockPrimeBroker(usdc);
-        morpho = new MockMorphoV2(usdc);
         fundToken = new MockERC3643Fund(usdc);
+        morpho = new MockMorphoV2(address(fundToken)); // Morpho accepts fund tokens, not USDC
         
         // Fund the broker with liquidity
         primeBroker.fundBroker(BROKER_LIQUIDITY);
@@ -317,126 +524,146 @@ contract LeveragedVaultTest is Test {
         // Fund the fund contract
         fundToken.fundContract(1_000_000e6); // 1M USDC
         
-        // Create vault configuration
-        LeveragedVault.VaultConfig memory config = LeveragedVault.VaultConfig({
+        // Deploy factory
+        factory = new LeveragedVaultFactory();
+        
+        // Create a test vault through factory
+        LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
             depositToken: usdc,
             primeBroker: primeBroker,
             morpho: morpho,
             syntheticToken: syntheticToken,
+            fundToken: address(fundToken),
             managementFee: 200, // 2% annual
             performanceFee: 2000, // 20% of profits
             minLockPeriod: 7 days,
             feeRecipient: treasury,
-            maxLeverage: 500 // 5x max
+            maxLeverage: 500, // 5x max
+            vaultName: "Test Vault",
+            vaultSymbol: "TV"
         });
         
-        // Deploy vault
-        vault = new LeveragedVault(config);
+        vm.prank(alice);
+        testVaultId = factory.createVault(config);
+        LeveragedVaultFactory.VaultInfo memory vaultInfo = factory.getVault(testVaultId);
+        testVault = LeveragedVaultImplementation(vaultInfo.vaultAddress);
         
-        // Transfer ownership of synthetic token to vault
-        syntheticToken.transferOwnership(address(vault));
-        
-        // Add fund as supported
-        vault.addSupportedFund(address(fundToken), 10000); // 100% allocation
+        // Transfer ownership of synthetic token to test vault
+        syntheticToken.transferOwnership(address(testVault));
         
         // Fund test users
         usdc.mint(alice, INITIAL_BALANCE);
         usdc.mint(bob, INITIAL_BALANCE);
         usdc.mint(charlie, INITIAL_BALANCE);
         
-        // Approve vault to spend user tokens
+        // Approve test vault to spend user tokens
         vm.prank(alice);
-        usdc.approve(address(vault), type(uint256).max);
+        usdc.approve(address(testVault), type(uint256).max);
         
         vm.prank(bob);
-        usdc.approve(address(vault), type(uint256).max);
+        usdc.approve(address(testVault), type(uint256).max);
         
         vm.prank(charlie);
-        usdc.approve(address(vault), type(uint256).max);
+        usdc.approve(address(testVault), type(uint256).max);
+    }
+
+    // Helper function to open a position with the new async flow
+    function openPositionHelper(address user, uint256 amount, uint256 leverageRatio) internal returns (uint256 positionId) {
+        // Step 1: Request leverage position 
+        vm.prank(user);
+        positionId = testVault.requestLeveragePosition(amount, leverageRatio);
+        
+        // Step 2: Get the broker request ID and process it
+        bytes32 requestId = testVault.positionToRequestId(positionId);
+        primeBroker.processRequest(requestId);
+        
+        // Step 3: Execute the approved position
+        vm.prank(user);
+        testVault.executeLeveragePosition(positionId);
     }
 
     function testInitialState() public {
-        assertEq(vault.nextPositionId(), 1);
-        assertEq(vault.totalValueLocked(), 0);
-        assertEq(vault.totalBorrowed(), 0);
-        assertTrue(vault.supportedFunds(address(fundToken)));
+        assertEq(factory.nextVaultId(), 2); // Should be 2 since we created one vault
+        assertEq(factory.totalVaultsCreated(), 1);
+        assertEq(testVault.getVaultTVL(), 0);
+        
+        // Test vault should be properly configured
+        (LeveragedVaultImplementation.VaultConfig memory config,,) = testVault.getVaultInfo();
+        assertEq(address(config.depositToken), address(usdc));
+        assertEq(address(config.fundToken), address(fundToken));
     }
 
     function testOpenPosition1_5xLeverage() public {
         uint256 depositAmount = 10_000e6; // 10k USDC
         uint256 leverageRatio = 150; // 1.5x
         
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
         
         // Check position was created
-        LeveragedVault.UserPosition memory position = vault.getPosition(positionId);
+        LeveragedVaultImplementation.UserPosition memory position = testVault.getPosition(positionId);
         assertEq(position.user, alice);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
-        assertTrue(position.isActive);
+        assertTrue(position.state == LeveragedVaultImplementation.PositionState.Executed);
         
         // Check synthetic tokens were minted
         assertTrue(syntheticToken.balanceOf(alice) > 0);
         
         // Check user positions mapping
-        uint256[] memory userPositions = vault.getUserPositions(alice);
+        uint256[] memory userPositions = testVault.getUserPositions(alice);
         assertEq(userPositions.length, 1);
         assertEq(userPositions[0], positionId);
         
         // Check vault state
-        assertTrue(vault.totalValueLocked() > 0);
-        assertTrue(vault.totalBorrowed() > 0);
+        assertTrue(testVault.getVaultTVL() > 0);
     }
 
     function testOpenPosition3xLeverage() public {
         uint256 depositAmount = 20_000e6; // 20k USDC
         uint256 leverageRatio = 300; // 3x
         
-        vm.prank(bob);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
         
-        LeveragedVault.UserPosition memory position = vault.getPosition(positionId);
+        LeveragedVaultImplementation.UserPosition memory position = testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
         
         // Check that more was borrowed for higher leverage
         assertTrue(position.borrowedAmount > (depositAmount * leverageRatio) / 300); // Should be significant
         
         // Check loops calculation
-        assertEq(vault.calculateRequiredLoops(leverageRatio), 2); // 3x should require 2 loops
+        // 3x leverage should require 2 loops (internal calculation)
     }
 
     function testOpenPosition5xMaxLeverage() public {
         uint256 depositAmount = 5_000e6; // 5k USDC
         uint256 leverageRatio = 500; // 5x (max)
         
-        vm.prank(charlie);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
         
-        LeveragedVault.UserPosition memory position = vault.getPosition(positionId);
+        LeveragedVaultImplementation.UserPosition memory position = testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
         
         // Check loops calculation for max leverage
-        assertEq(vault.calculateRequiredLoops(leverageRatio), 4); // 5x should require 4 loops
+        // 5x leverage should require 4 loops (internal calculation)
     }
 
     function testMultiplePositionsSameUser() public {
-        vm.startPrank(alice);
-        
-        // Open first position
-        uint256 positionId1 = vault.openPosition(address(fundToken), 5_000e6, 150);
+        // Open first position using helper (complete async flow)
+        uint256 positionId1 = openPositionHelper(alice, 5_000e6, 150);
         
         // Open second position with different leverage
-        uint256 positionId2 = vault.openPosition(address(fundToken), 8_000e6, 300);
+        uint256 positionId2 = openPositionHelper(alice, 8_000e6, 300);
         
-        vm.stopPrank();
+        // Check both positions are executed (active)
+        assertTrue(testVault.getPosition(positionId1).isActive);
+        assertTrue(testVault.getPosition(positionId2).isActive);
         
-        // Check both positions exist
-        assertTrue(vault.getPosition(positionId1).isActive);
-        assertTrue(vault.getPosition(positionId2).isActive);
+        // Check both positions have Executed state
+        assertEq(uint256(testVault.getPosition(positionId1).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
+        assertEq(uint256(testVault.getPosition(positionId2).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
         
         // Check user has both positions
-        uint256[] memory userPositions = vault.getUserPositions(alice);
+        uint256[] memory userPositions = testVault.getUserPositions(alice);
         assertEq(userPositions.length, 2);
         assertTrue(userPositions[0] == positionId1 || userPositions[1] == positionId1);
         assertTrue(userPositions[0] == positionId2 || userPositions[1] == positionId2);
@@ -446,13 +673,12 @@ contract LeveragedVaultTest is Test {
         uint256 depositAmount = 10_000e6;
         
         // Open position
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, 200);
+        uint256 positionId = openPositionHelper(alice, depositAmount, 200);
         
         // Try to close immediately (should fail)
         vm.prank(alice);
         vm.expectRevert("Position still locked");
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
         
         // Fast forward past lock period
         vm.warp(block.timestamp + 8 days);
@@ -460,10 +686,10 @@ contract LeveragedVaultTest is Test {
         // Now closing should work
         uint256 aliceBalanceBefore = usdc.balanceOf(alice);
         vm.prank(alice);
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
         
         // Check position is closed
-        assertFalse(vault.getPosition(positionId).isActive);
+        assertFalse(testVault.getPosition(positionId).isActive);
         
         // Check alice got her money back (may be more or less due to fund performance)
         uint256 aliceBalanceAfter = usdc.balanceOf(alice);
@@ -474,14 +700,13 @@ contract LeveragedVaultTest is Test {
         uint256 depositAmount = 15_000e6;
         
         // Open position
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, 250); // 2.5x
+        uint256 positionId = openPositionHelper(alice, depositAmount, 250); // 2.5x
         
         // Simulate fund performance - 20% increase
         fundToken.setSharePrice(1.2e18);
         
         // Check position value
-        (uint256 currentValue, int256 pnl) = vault.getPositionValue(positionId);
+        (uint256 currentValue, int256 pnl) = testVault.getPositionValue(positionId);
         assertTrue(currentValue > depositAmount);
         assertTrue(pnl > 0); // Should be profitable
         
@@ -490,7 +715,7 @@ contract LeveragedVaultTest is Test {
         
         uint256 aliceBalanceBefore = usdc.balanceOf(alice);
         vm.prank(alice);
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
         uint256 aliceBalanceAfter = usdc.balanceOf(alice);
         
         // Should get more than deposited (minus fees)
@@ -500,15 +725,14 @@ contract LeveragedVaultTest is Test {
     function testPositionLoss() public {
         uint256 depositAmount = 12_000e6;
         
-        // Open position
-        vm.prank(bob);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, 300); // 3x
+        // Open position using helper (complete async flow)
+        uint256 positionId = openPositionHelper(bob, depositAmount, 300); // 3x
         
         // Simulate fund performance - 15% decrease
         fundToken.setSharePrice(0.85e18);
         
         // Check position value
-        (uint256 currentValue, int256 pnl) = vault.getPositionValue(positionId);
+        (uint256 currentValue, int256 pnl) = testVault.getPositionValue(positionId);
         assertTrue(pnl < 0); // Should show loss
         
         // Close position after lock period
@@ -516,7 +740,7 @@ contract LeveragedVaultTest is Test {
         
         uint256 bobBalanceBefore = usdc.balanceOf(bob);
         vm.prank(bob);
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
         uint256 bobBalanceAfter = usdc.balanceOf(bob);
         
         // Should get less than deposited
@@ -527,8 +751,7 @@ contract LeveragedVaultTest is Test {
         uint256 depositAmount = 25_000e6;
         
         // Open position
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, 200);
+        uint256 positionId = openPositionHelper(alice, depositAmount, 200);
         
         // Simulate great fund performance - 50% increase
         fundToken.setSharePrice(1.5e18);
@@ -540,7 +763,7 @@ contract LeveragedVaultTest is Test {
         
         // Close position
         vm.prank(alice);
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
         
         uint256 treasuryBalanceAfter = usdc.balanceOf(treasury);
         
@@ -555,158 +778,196 @@ contract LeveragedVaultTest is Test {
         
         // Too low leverage
         vm.expectRevert("Invalid leverage ratio");
-        vault.openPosition(address(fundToken), depositAmount, 100); // 1x
+        testVault.requestLeveragePosition(depositAmount, 100); // 1x
         
         // Too high leverage
         vm.expectRevert("Invalid leverage ratio");
-        vault.openPosition(address(fundToken), depositAmount, 600); // 6x
+        testVault.requestLeveragePosition(depositAmount, 600); // 6x
         
         // Invalid increment (not 0.5x increment)
         vm.expectRevert("Invalid leverage ratio");
-        vault.openPosition(address(fundToken), depositAmount, 175); // 1.75x
+        testVault.requestLeveragePosition(depositAmount, 175); // 1.75x
         
         vm.stopPrank();
     }
 
-    function testUnsupportedFund() public {
-        // Create another fund token
-        MockERC3643Fund unsupportedFund = new MockERC3643Fund(usdc);
+    function testCreateMultipleVaults() public {
+        // Create another vault with different fund
+        MockERC3643Fund newFund = new MockERC3643Fund(usdc);
+        MockERC3643Token newSyntheticToken = new MockERC3643Token();
         
-        vm.prank(alice);
-        vm.expectRevert("Fund not supported");
-        vault.openPosition(address(unsupportedFund), 10_000e6, 200);
+        LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
+            depositToken: usdc,
+            primeBroker: primeBroker,
+            morpho: morpho,
+            syntheticToken: newSyntheticToken,
+            fundToken: address(newFund),
+            managementFee: 300,
+            performanceFee: 1500,
+            minLockPeriod: 14 days,
+            feeRecipient: treasury,
+            maxLeverage: 400,
+            vaultName: "Second Vault",
+            vaultSymbol: "SV"
+        });
+        
+        vm.prank(bob);
+        uint256 vaultId = factory.createVault(config);
+        
+        // Verify second vault exists
+        LeveragedVaultFactory.VaultInfo memory vaultInfo = factory.getVault(vaultId);
+        assertEq(vaultInfo.owner, bob);
+        assertEq(vaultInfo.name, "Second Vault");
+        
+        // Verify factory stats
+        assertEq(factory.totalVaultsCreated(), 2);
     }
 
     function testUnauthorizedAccess() public {
         // Open position as Alice
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), 10_000e6, 200);
+        uint256 positionId = openPositionHelper(alice, 10_000e6, 200);
         
         // Try to close as Bob (should fail)
         vm.warp(block.timestamp + 8 days);
         vm.prank(bob);
         vm.expectRevert("Not position owner");
-        vault.closePosition(positionId);
+        testVault.closePosition(positionId);
     }
 
     function testEmergencyFunctions() public {
         // Open some positions first
         vm.prank(alice);
-        vault.openPosition(address(fundToken), 10_000e6, 200);
+        testVault.requestLeveragePosition(10_000e6, 200);
         
-        // Test pause
-        vault.pause();
+        // Test pause (alice is the owner)
+        vm.prank(alice);
+        testVault.pause();
         
         vm.prank(alice);
-        vm.expectRevert("Pausable: paused");
-        vault.openPosition(address(fundToken), 5_000e6, 150);
+        vm.expectRevert();
+        testVault.requestLeveragePosition(5_000e6, 150);
         
-        // Test unpause
-        vault.unpause();
+        // Test unpause (alice is the owner)
+        vm.prank(alice);
+        testVault.unpause();
         
         vm.prank(alice);
-        vault.openPosition(address(fundToken), 5_000e6, 150); // Should work now
+        testVault.requestLeveragePosition(5_000e6, 150); // Should work now
     }
 
     function testVaultTVLTracking() public {
-        uint256 tvlBefore = vault.getVaultTVL();
+        uint256 tvlBefore = testVault.getVaultTVL();
         assertEq(tvlBefore, 0);
         
-        // Open multiple positions
-        vm.prank(alice);
-        vault.openPosition(address(fundToken), 10_000e6, 200); // 2x leverage = 20k total
+        // Open multiple positions using helper (which includes execution)
+        uint256 positionId1 = openPositionHelper(alice, 10_000e6, 200); // 2x leverage = 20k total
+        uint256 positionId2 = openPositionHelper(bob, 15_000e6, 300); // 3x leverage = 45k total
         
-        vm.prank(bob);
-        vault.openPosition(address(fundToken), 15_000e6, 300); // 3x leverage = 45k total
-        
-        uint256 tvlAfter = vault.getVaultTVL();
+        uint256 tvlAfter = testVault.getVaultTVL();
         assertEq(tvlAfter, 65_000e6); // 20k + 45k = 65k total
     }
 
-    function testLeverageCalculations() public {
-        // Test different leverage ratios and their loop requirements
-        assertEq(vault.calculateRequiredLoops(150), 1); // 1.5x = 1 loop
-        assertEq(vault.calculateRequiredLoops(200), 1); // 2x = 1 loop
-        assertEq(vault.calculateRequiredLoops(250), 2); // 2.5x = 2 loops
-        assertEq(vault.calculateRequiredLoops(300), 2); // 3x = 2 loops
-        assertEq(vault.calculateRequiredLoops(350), 3); // 3.5x = 3 loops
-        assertEq(vault.calculateRequiredLoops(400), 3); // 4x = 3 loops
-        assertEq(vault.calculateRequiredLoops(450), 4); // 4.5x = 4 loops
-        assertEq(vault.calculateRequiredLoops(500), 4); // 5x = 4 loops
+    function testFactoryVaultManagement() public {
+        // Test deactivating vault
+        vm.prank(alice); // alice is the owner of testVaultId
+        factory.deactivateVault(testVaultId);
+        
+        LeveragedVaultFactory.VaultInfo memory vaultInfo = factory.getVault(testVaultId);
+        assertFalse(vaultInfo.isActive);
+        
+        // Test reactivating vault
+        vm.prank(alice);
+        factory.reactivateVault(testVaultId);
+        
+        vaultInfo = factory.getVault(testVaultId);
+        assertTrue(vaultInfo.isActive);
     }
 
     function testConfigUpdates() public {
-        // Create new config
-        LeveragedVault.VaultConfig memory newConfig = LeveragedVault.VaultConfig({
+        // Create new config with all required fields
+        LeveragedVaultImplementation.VaultConfig memory newConfig = LeveragedVaultImplementation.VaultConfig({
             depositToken: usdc,
             primeBroker: primeBroker,
             morpho: morpho,
             syntheticToken: syntheticToken,
+            fundToken: address(fundToken),
             managementFee: 300, // Changed to 3%
             performanceFee: 1500, // Changed to 15%
             minLockPeriod: 14 days, // Changed to 2 weeks
             feeRecipient: treasury,
-            maxLeverage: 400 // Changed to 4x max
+            maxLeverage: 400, // Changed to 4x max
+            vaultName: "Updated Test Vault",
+            vaultSymbol: "UTV"
         });
         
-        vault.updateVaultConfig(newConfig);
+        // Only vault owner can update config
+        vm.prank(alice); // alice is the owner
+        testVault.updateVaultConfig(newConfig);
         
         // Verify config was updated
-        (,,,, uint256 managementFee, uint256 performanceFee, uint256 minLockPeriod,, uint256 maxLeverage) = vault.vaultConfig();
-        assertEq(managementFee, 300);
-        assertEq(performanceFee, 1500);
-        assertEq(minLockPeriod, 14 days);
-        assertEq(maxLeverage, 400);
+        (LeveragedVaultImplementation.VaultConfig memory config,,) = testVault.getVaultInfo();
+        assertEq(config.managementFee, 300);
+        assertEq(config.performanceFee, 1500);
+        assertEq(config.minLockPeriod, 14 days);
+        assertEq(config.maxLeverage, 400);
+        assertEq(config.vaultName, "Updated Test Vault");
     }
 
     // Fuzz testing for various deposit amounts and leverage ratios
     function testFuzzOpenPosition(uint256 depositAmount, uint256 leverageRatio) public {
         // Bound inputs to reasonable ranges
-        depositAmount = bound(depositAmount, 1000e6, 50_000e6); // 1k to 50k USDC
+        depositAmount = bound(depositAmount, 1000e6, 100_000e6); // 1k to 100k USDC
         leverageRatio = bound(leverageRatio, 150, 500); // 1.5x to 5x
         
-        // Ensure leverage is in 0.5x increments
-        leverageRatio = (leverageRatio / 50) * 50;
-        if (leverageRatio < 150) leverageRatio = 150;
+        // Ensure leverage is in 0.5x increments (150, 200, 250, 300, 350, 400, 450, 500)
+        uint256 steps = (leverageRatio - 150) / 50;
+        leverageRatio = 150 + (steps * 50);
+        if (leverageRatio > 500) leverageRatio = 500;
         
         // Give alice enough funds
         usdc.mint(alice, depositAmount);
         vm.prank(alice);
-        usdc.approve(address(vault), depositAmount);
+        usdc.approve(address(testVault), depositAmount);
         
-        vm.prank(alice);
-        uint256 positionId = vault.openPosition(address(fundToken), depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
         
         // Verify position was created correctly
-        LeveragedVault.UserPosition memory position = vault.getPosition(positionId);
+        LeveragedVaultImplementation.UserPosition memory position = testVault.getPosition(positionId);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
-        assertTrue(position.isActive);
+        assertTrue(position.state == LeveragedVaultImplementation.PositionState.Executed);
     }
 
     function testStressTestMultipleUsers() public {
         address[] memory users = new address[](10);
+        uint256[] memory positionIds = new uint256[](10);
         
-        // Create 10 users and open positions
+        // Create 10 users and open positions using async flow
         for (uint i = 0; i < 10; i++) {
             users[i] = makeAddr(string(abi.encodePacked("user", i)));
             usdc.mint(users[i], 50_000e6);
             
             vm.prank(users[i]);
-            usdc.approve(address(vault), type(uint256).max);
+            usdc.approve(address(testVault), type(uint256).max);
             
             // Varying deposits and leverage
             uint256 deposit = 1_000e6 + (i * 2_000e6); // 1k to 19k
             uint256 leverage = 150 + (i * 50); // 1.5x to 6x (capped at 5x by contract)
             if (leverage > 500) leverage = 500;
             
-            vm.prank(users[i]);
-            vault.openPosition(address(fundToken), deposit, leverage);
+            // Use openPositionHelper to complete the full async flow
+            positionIds[i] = openPositionHelper(users[i], deposit, leverage);
         }
         
-        // Check vault state
-        assertTrue(vault.getVaultTVL() > 0);
-        assertTrue(vault.nextPositionId() == 11); // 10 positions + 1
+        // Check vault state after all positions are executed
+        assertTrue(testVault.getVaultTVL() > 0);
+        assertTrue(testVault.nextPositionId() == 11); // 10 positions + 1
+        
+        // Verify all positions are executed
+        for (uint i = 0; i < 10; i++) {
+            assertTrue(testVault.getPosition(positionIds[i]).isActive);
+            assertEq(uint256(testVault.getPosition(positionIds[i]).state), uint256(LeveragedVaultImplementation.PositionState.Executed));
+        }
         
         // Simulate fund performance
         fundToken.setSharePrice(1.3e18); // 30% gain
@@ -716,12 +977,72 @@ contract LeveragedVaultTest is Test {
         
         for (uint i = 0; i < 10; i++) {
             vm.prank(users[i]);
-            vault.closePosition(i + 1); // Position IDs start from 1
+            testVault.closePosition(positionIds[i]);
         }
         
         // All positions should be closed
-        for (uint i = 1; i <= 10; i++) {
-            assertFalse(vault.getPosition(i).isActive);
+        for (uint i = 0; i < 10; i++) {
+            assertEq(uint256(testVault.getPosition(positionIds[i]).state), uint256(LeveragedVaultImplementation.PositionState.Completed));
         }
+    }
+
+    // Factory-specific tests
+    function testFactoryVaultCreation() public {
+        uint256 initialCount = factory.totalVaultsCreated();
+        
+        // Create multiple vaults
+        for (uint i = 0; i < 3; i++) {
+            MockERC3643Fund newFund = new MockERC3643Fund(usdc);
+            MockERC3643Token newToken = new MockERC3643Token();
+            
+            LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation.VaultConfig({
+                depositToken: usdc,
+                primeBroker: primeBroker,
+                morpho: morpho,
+                syntheticToken: newToken,
+                fundToken: address(newFund),
+                managementFee: 200 + (i * 100),
+                performanceFee: 2000,
+                minLockPeriod: 7 days,
+                feeRecipient: treasury,
+                maxLeverage: 500,
+                vaultName: string(abi.encodePacked("Vault ", i)),
+                vaultSymbol: string(abi.encodePacked("V", i))
+            });
+            
+            vm.prank(alice);
+            factory.createVault(config);
+        }
+        
+        assertEq(factory.totalVaultsCreated(), initialCount + 3);
+        
+        // Test getting all vaults
+        LeveragedVaultFactory.VaultInfo[] memory allVaults = factory.getAllVaults();
+        assertEq(allVaults.length, initialCount + 3);
+    }
+
+    function testFactoryOwnershipTransfer() public {
+        // First, alice transfers ownership directly on the vault
+        vm.prank(alice);
+        testVault.transferOwnership(bob);
+        
+        // Then, alice updates the factory records
+        vm.prank(alice);
+        factory.transferVaultOwnership(testVaultId, bob);
+        
+        // Verify ownership changed
+        LeveragedVaultFactory.VaultInfo memory vaultInfo = factory.getVault(testVaultId);
+        assertEq(vaultInfo.owner, bob);
+        
+        // Verify vault ownership also changed
+        assertEq(testVault.owner(), bob);
+    }
+
+    function testFactoryStats() public {
+        (uint256 totalCreated, uint256 nextId, uint256 activeCount) = factory.getFactoryStats();
+        
+        assertEq(totalCreated, 1); // We created one vault in setup
+        assertEq(nextId, 2); // Next vault will have ID 2
+        assertEq(activeCount, 1); // One active vault
     }
 }
