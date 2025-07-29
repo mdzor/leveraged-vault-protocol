@@ -8,7 +8,7 @@ import "./LeveragedVaultImplementation.sol";
 
 /**
  * @title LeveragedVaultFactory
- * @dev Factory contract for deploying individual leveraged vaults
+ * Factory contract for deploying individual leveraged vaults
  * Each vault targets a specific ERC3643 fund with configurable parameters
  */
 contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
@@ -57,7 +57,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Create a new leveraged vault
      * @param config Vault configuration parameters
      * @return vaultId The ID of the newly created vault
      */
@@ -107,7 +106,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Deactivate a vault (only vault owner)
      * @param vaultId The vault to deactivate
      */
     function deactivateVault(uint256 vaultId) external nonReentrant validVault(vaultId) {
@@ -121,7 +119,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Reactivate a vault (only vault owner)
      * @param vaultId The vault to reactivate
      */
     function reactivateVault(uint256 vaultId) external nonReentrant {
@@ -137,7 +134,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @dev Transfer vault ownership (called by vault owner)
      * @param vaultId The vault to transfer
      * @param newOwner The new owner address
      * Note: This function requires the current vault owner to first call
@@ -173,14 +169,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         return userVaults[user];
     }
 
-    function getVaultByAddress(address vaultAddress)
-        external
-        view
-        returns (uint256 vaultId, VaultInfo memory vault)
-    {
-        vaultId = vaultIdByAddress[vaultAddress];
-        vault = vaults[vaultId];
-    }
 
     function getAllVaults() external view returns (VaultInfo[] memory) {
         VaultInfo[] memory allVaults = new VaultInfo[](totalVaultsCreated);
@@ -196,28 +184,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         return allVaults;
     }
 
-    function getActiveVaults() external view returns (VaultInfo[] memory) {
-        // Count active vaults first
-        uint256 activeCount = 0;
-        for (uint256 i = 1; i < nextVaultId; i++) {
-            if (vaults[i].isActive) {
-                activeCount++;
-            }
-        }
-
-        // Create array of active vaults
-        VaultInfo[] memory activeVaults = new VaultInfo[](activeCount);
-        uint256 index = 0;
-
-        for (uint256 i = 1; i < nextVaultId; i++) {
-            if (vaults[i].isActive) {
-                activeVaults[index] = vaults[i];
-                index++;
-            }
-        }
-
-        return activeVaults;
-    }
 
     function getTotalVaultsCreated() external view returns (uint256) {
         return totalVaultsCreated;

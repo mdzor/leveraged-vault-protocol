@@ -24,7 +24,6 @@ contract Interact is Script {
         address usdc = vm.envAddress("USDC");
         address primeBroker = vm.envAddress("PRIME_BROKER");
         address syntheticToken = vm.envAddress("SYNTHETIC_TOKEN");
-        address mockFund = vm.envAddress("MOCK_FUND");
         uint256 vaultId = vm.envUint("VAULT_ID");
 
         vm.startBroadcast(deployerPrivateKey);
