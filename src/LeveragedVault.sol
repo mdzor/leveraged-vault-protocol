@@ -170,26 +170,30 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         return vaults[vaultId];
     }
 
-    function getUserVaults(address user, uint256 offset, uint256 limit) external view returns (uint256[] memory, uint256 totalCount, bool hasMore) {
+    function getUserVaults(address user, uint256 offset, uint256 limit)
+        external
+        view
+        returns (uint256[] memory, uint256 totalCount, bool hasMore)
+    {
         require(limit > 0 && limit <= 100, "Invalid limit: must be 1-100");
-        
+
         uint256[] memory userVaultList = userVaults[user];
         totalCount = userVaultList.length;
-        
+
         if (offset >= totalCount) {
             return (new uint256[](0), totalCount, false);
         }
-        
+
         uint256 remaining = totalCount - offset;
         uint256 actualLimit = remaining > limit ? limit : remaining;
         uint256[] memory vaults_page = new uint256[](actualLimit);
-        
+
         unchecked {
             for (uint256 i = 0; i < actualLimit; ++i) {
                 vaults_page[i] = userVaultList[offset + i];
             }
         }
-        
+
         hasMore = (offset + actualLimit) < totalCount;
         return (vaults_page, totalCount, hasMore);
     }
@@ -200,18 +204,22 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         return vaults_page;
     }
 
-    function getAllVaults(uint256 offset, uint256 limit) external view returns (VaultInfo[] memory, uint256 totalCount, bool hasMore) {
+    function getAllVaults(uint256 offset, uint256 limit)
+        external
+        view
+        returns (VaultInfo[] memory, uint256 totalCount, bool hasMore)
+    {
         require(limit > 0 && limit <= 100, "Invalid limit: must be 1-100");
-        
+
         totalCount = totalVaultsCreated;
         if (offset >= totalCount) {
             return (new VaultInfo[](0), totalCount, false);
         }
-        
+
         uint256 remaining = totalCount - offset;
         uint256 actualLimit = remaining > limit ? limit : remaining;
         VaultInfo[] memory vaults_page = new VaultInfo[](actualLimit);
-        
+
         uint256 index = 0;
         uint256 found = 0;
         uint256 nextVaultIdCached = nextVaultId;
