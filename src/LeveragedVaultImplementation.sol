@@ -383,22 +383,41 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     {
         Position storage position = positions[positionId];
 
+        // CEI Pattern: Effects First - Update state before any external calls
+        uint8 oldState = position.state;
+        position.state = uint8(PositionState.Executed); // Prevent re-execution
+
         // Cache frequently accessed storage variables
         VaultConfig memory config = vaultConfig;
         uint256 approvedAmount = position.executionData; // Get approved amount from packed data
         uint256 depositAmount = position.depositAmount;
+        address positionUser = position.user; // Cache user address
+        uint16 leverageRatio = position.leverageRatio; // Cache leverage ratio
 
+        // Safe addition with overflow check
+        uint256 totalInvestAmount = depositAmount + approvedAmount;
+        if (totalInvestAmount < depositAmount) revert ArithmeticOverflow();
+
+        // Update vault totals early with overflow checks
+        uint256 newTVL = totalValueLocked + totalInvestAmount;
+        if (newTVL < totalValueLocked) revert ArithmeticOverflow();
+        uint256 newBorrowed = totalBorrowed + approvedAmount;
+        if (newBorrowed < totalBorrowed) revert ArithmeticOverflow();
+
+        totalValueLocked = newTVL;
+        totalBorrowed = newBorrowed;
+
+        // CEI Pattern: Interactions Last - All external calls after state updates
         // Get leverage funds from broker (broker provides the leverage)
         try config.primeBroker.borrow(address(config.depositToken), approvedAmount) {
             // Success - continue
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to borrow from prime broker");
         }
-
-        // Now vault has: original deposit + leverage funds
-        // Safe addition with overflow check
-        uint256 totalInvestAmount = depositAmount + approvedAmount;
-        if (totalInvestAmount < depositAmount) revert ArithmeticOverflow();
 
         // Get expected fund tokens for slippage protection with zero check
         if (totalInvestAmount == 0) revert InvalidAmount();
@@ -416,6 +435,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
                 fundTokensReceived >= minFundTokens, "Slippage: insufficient fund tokens received"
             );
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to invest in fund");
         }
 
@@ -428,6 +451,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         ) {
             // Success - continue
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to supply collateral to Morpho");
         }
 
@@ -437,6 +464,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         ) {
             // Success - continue
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to borrow from Morpho");
         }
 
@@ -445,41 +476,38 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         try config.primeBroker.repay(address(config.depositToken), approvedAmount) {
             // Success - continue
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to repay prime broker");
         }
 
-        // Mint synthetic tokens to user
+        // Calculate synthetic tokens
         uint256 syntheticTokens =
-            LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, position.leverageRatio);
-        try config.syntheticToken.mint(position.user, syntheticTokens) {
+            LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, leverageRatio);
+
+        // Mint synthetic tokens to user
+        try config.syntheticToken.mint(positionUser, syntheticTokens) {
             // Success - continue
         } catch {
+            // Revert state changes on failure
+            position.state = oldState;
+            totalValueLocked -= totalInvestAmount;
+            totalBorrowed -= approvedAmount;
             revert("Failed to mint synthetic tokens");
         }
 
-        // MINIMAL STORAGE WRITES - Only update essential data
-        uint8 oldState = position.state;
-        position.state = uint8(PositionState.Executed); // Update state in existing slot
-
-        // Store execution data separately - only when executed
+        // Store execution data separately - only when fully executed
         executedPositions[positionId] = ExecutedPositionData({
             syntheticTokensMinted: syntheticTokens,
             fundTokensOwned: fundTokensReceived,
             borrowedAmount: approvedAmount,
             brokerRequestId: bytes32(0) // Can be retrieved from events if needed
-         }); // This is 4 storage slots, but only stored once at execution
-
-        // Update vault totals with overflow checks
-        uint256 newTVL = totalValueLocked + totalInvestAmount;
-        if (newTVL < totalValueLocked) revert ArithmeticOverflow();
-        uint256 newBorrowed = totalBorrowed + approvedAmount;
-        if (newBorrowed < totalBorrowed) revert ArithmeticOverflow();
-
-        totalValueLocked = newTVL;
-        totalBorrowed = newBorrowed;
+         });
 
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Executed);
-        emit PositionExecuted(positionId, position.user, fundTokensReceived, syntheticTokens);
+        emit PositionExecuted(positionId, positionUser, fundTokensReceived, syntheticTokens);
     }
 
     /**
@@ -684,12 +712,15 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         // Clean up executed position data
         delete executedPositions[positionId];
 
+        // Cache user address for events and transfer
+        address positionUser = msg.sender;
+
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Completed);
-        emit PositionClosed(positionId, msg.sender, finalAmount, pnl);
+        emit PositionClosed(positionId, positionUser, finalAmount, pnl);
 
         // CEI Pattern: Interactions last - return funds to user after all state updates
         if (finalAmount > 0) {
-            config.depositToken.safeTransfer(msg.sender, finalAmount);
+            config.depositToken.safeTransfer(positionUser, finalAmount);
         }
     }
 
@@ -811,8 +842,34 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         }
     }
 
+    function getUserPositions(address user, uint256 offset, uint256 limit) external view returns (uint256[] memory, uint256 totalCount, bool hasMore) {
+        require(limit > 0 && limit <= 100, "Invalid limit: must be 1-100");
+        
+        uint256[] memory userPositionList = userPositions[user];
+        totalCount = userPositionList.length;
+        
+        if (offset >= totalCount) {
+            return (new uint256[](0), totalCount, false);
+        }
+        
+        uint256 remaining = totalCount - offset;
+        uint256 actualLimit = remaining > limit ? limit : remaining;
+        uint256[] memory positions_page = new uint256[](actualLimit);
+        
+        unchecked {
+            for (uint256 i = 0; i < actualLimit; ++i) {
+                positions_page[i] = userPositionList[offset + i];
+            }
+        }
+        
+        hasMore = (offset + actualLimit) < totalCount;
+        return (positions_page, totalCount, hasMore);
+    }
+
+    // Legacy function for backward compatibility - limited to first 50 positions
     function getUserPositions(address user) external view returns (uint256[] memory) {
-        return userPositions[user];
+        (uint256[] memory positions_page,,) = this.getUserPositions(user, 0, 50);
+        return positions_page;
     }
 
     function getPositionValue(uint256 positionId)
