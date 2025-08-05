@@ -265,18 +265,16 @@ contract MockPrimeBroker is IPrimeBroker {
         for (uint256 i = 0; i < allRequestIds.length; i++) {
             bytes32 requestId = allRequestIds[i];
             LeverageRequest storage request = leverageRequests[requestId];
-            
+
             if (!request.isProcessed) {
                 // Auto-approve the request
                 request.isProcessed = true;
                 request.isApproved = true;
-                
+
                 // Call the vault's approval handler to update position state
                 (bool success,) = request.vault.call(
                     abi.encodeWithSignature(
-                        "handleBrokerApproval(bytes32,uint256)", 
-                        requestId, 
-                        request.leverageAmount
+                        "handleBrokerApproval(bytes32,uint256)", requestId, request.leverageAmount
                     )
                 );
                 require(success, "Vault approval call failed");
@@ -686,7 +684,7 @@ contract LeveragedVaultFactoryTest is Test {
         testVault.executeLeveragePosition(positionId);
     }
 
-    function testInitialState() public {
+    function testInitialState() public view {
         assertEq(factory.nextVaultId(), 2); // Should be 2 since we created one vault
         assertEq(factory.totalVaultsCreated(), 1);
         assertEq(testVault.getVaultTVL(), 0);
@@ -704,9 +702,10 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
         // Check position was created
-        (LeveragedVaultImplementation.Position memory position,
-         LeveragedVaultImplementation.ExecutedPositionData memory executedData) =
-            testVault.getPosition(positionId);
+        (
+            LeveragedVaultImplementation.Position memory position,
+            /* LeveragedVaultImplementation.ExecutedPositionData memory executedData */
+        ) = testVault.getPosition(positionId);
         assertEq(position.user, alice);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
@@ -730,9 +729,10 @@ contract LeveragedVaultFactoryTest is Test {
 
         uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
-        (LeveragedVaultImplementation.Position memory position,
-         LeveragedVaultImplementation.ExecutedPositionData memory executedData) =
-            testVault.getPosition(positionId);
+        (
+            LeveragedVaultImplementation.Position memory position,
+            LeveragedVaultImplementation.ExecutedPositionData memory executedData
+        ) = testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
 
         // Check that more was borrowed for higher leverage
@@ -748,8 +748,7 @@ contract LeveragedVaultFactoryTest is Test {
 
         uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
-        (LeveragedVaultImplementation.Position memory position,) =
-            testVault.getPosition(positionId);
+        (LeveragedVaultImplementation.Position memory position,) = testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
 
         // Check loops calculation for max leverage
@@ -856,7 +855,7 @@ contract LeveragedVaultFactoryTest is Test {
         fundToken.setSharePrice(0.85e18);
 
         // Check position value
-        (uint256 currentValue, int256 pnl) = testVault.getPositionValue(positionId);
+        (, int256 pnl) = testVault.getPositionValue(positionId);
         assertTrue(pnl < 0); // Should show loss
 
         // Close position after lock period
@@ -999,8 +998,8 @@ contract LeveragedVaultFactoryTest is Test {
         assertEq(tvlBefore, 0);
 
         // Open multiple positions using helper (which includes execution)
-        uint256 positionId1 = openPositionHelper(alice, 10_000e6, 200); // 2x leverage = 20k total
-        uint256 positionId2 = openPositionHelper(bob, 15_000e6, 300); // 3x leverage = 45k total
+        openPositionHelper(alice, 10_000e6, 200); // 2x leverage = 20k total
+        openPositionHelper(bob, 15_000e6, 300); // 3x leverage = 45k total
 
         uint256 tvlAfter = testVault.getVaultTVL();
         assertEq(tvlAfter, 65_000e6); // 20k + 45k = 65k total
@@ -1086,8 +1085,7 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
         // Verify position was created correctly
-        (LeveragedVaultImplementation.Position memory position,) =
-            testVault.getPosition(positionId);
+        (LeveragedVaultImplementation.Position memory position,) = testVault.getPosition(positionId);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
         assertTrue(position.state == uint8(LeveragedVaultImplementation.PositionState.Executed));
@@ -1217,7 +1215,7 @@ contract LeveragedVaultFactoryTest is Test {
         assertEq(testVault.owner(), bob);
     }
 
-    function testFactoryStats() public {
+    function testFactoryStats() public view {
         (uint256 totalCreated, uint256 nextId, uint256 activeCount) = factory.getFactoryStats();
 
         assertEq(totalCreated, 1); // We created one vault in setup
