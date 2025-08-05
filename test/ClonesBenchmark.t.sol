@@ -12,11 +12,11 @@ import "../src/LeveragedVaultImplementation.sol";
 contract ClonesBenchmarkTest is Test {
     LeveragedVaultFactory factory;
     LeveragedVaultImplementation.VaultConfig config;
-    
+
     function setUp() public {
         // Deploy factory (which creates the implementation)
         factory = new LeveragedVaultFactory();
-        
+
         // Create test config
         config = LeveragedVaultImplementation.VaultConfig({
             depositToken: IERC20(address(0x1)),
@@ -45,77 +45,77 @@ contract ClonesBenchmarkTest is Test {
             vaultSymbol: "TV"
         });
     }
-    
+
     function testDeploymentGasCosts() public {
         // Measure gas for clone deployment
         uint256 gasBefore = gasleft();
         factory.createVault(config);
         uint256 cloneGas = gasBefore - gasleft();
-        
+
         // Measure gas for direct deployment (for comparison)
         gasBefore = gasleft();
         new LeveragedVaultImplementation();
         uint256 directGas = gasBefore - gasleft();
-        
+
         console.log("Clone deployment gas:", cloneGas);
         console.log("Direct deployment gas:", directGas);
         console.log("Gas savings:", directGas - cloneGas);
         console.log("Percentage savings:", ((directGas - cloneGas) * 100) / directGas, "%");
-        
+
         // Clone should use significantly less gas
         assertLt(cloneGas, directGas);
     }
-    
+
     function testMultipleDeployments() public {
         uint256 totalCloneGas = 0;
         uint256 totalDirectGas = 0;
-        
+
         // Deploy 5 clones
-        for (uint i = 0; i < 5; i++) {
+        for (uint256 i = 0; i < 5; i++) {
             uint256 gasBefore = gasleft();
             factory.createVault(config);
             totalCloneGas += gasBefore - gasleft();
         }
-        
+
         // Deploy 5 direct contracts
-        for (uint i = 0; i < 5; i++) {
+        for (uint256 i = 0; i < 5; i++) {
             uint256 gasBefore = gasleft();
             new LeveragedVaultImplementation();
             totalDirectGas += gasBefore - gasleft();
         }
-        
+
         console.log("Total clone gas (5 deployments):", totalCloneGas);
         console.log("Total direct gas (5 deployments):", totalDirectGas);
         console.log("Total gas savings:", totalDirectGas - totalCloneGas);
         console.log("Average gas per clone:", totalCloneGas / 5);
         console.log("Average gas per direct:", totalDirectGas / 5);
-        
+
         assertLt(totalCloneGas, totalDirectGas);
     }
-    
+
     function testImplementationIsNotInitialized() public view {
         address impl = factory.getImplementation();
         LeveragedVaultImplementation implContract = LeveragedVaultImplementation(impl);
-        
+
         // Implementation should be initialized (locked)
         assertTrue(implContract.isInitialized());
-        
+
         // But should not be usable (owner is address(1) - dummy address)
         assertEq(implContract.owner(), address(1));
     }
-    
+
     function testCloneIsProperlyInitialized() public {
         uint256 vaultId = factory.createVault(config);
         LeveragedVaultFactory.VaultInfo memory vaultInfo = factory.getVault(vaultId);
-        
+
         LeveragedVaultImplementation vault = LeveragedVaultImplementation(vaultInfo.vaultAddress);
-        
+
         // Clone should be initialized
         assertTrue(vault.isInitialized());
-        
+
         // Clone should have proper owner
         assertEq(vault.owner(), address(this));
-        
+
         // Clone should have proper factory
         assertEq(vault.factory(), address(factory));
     }

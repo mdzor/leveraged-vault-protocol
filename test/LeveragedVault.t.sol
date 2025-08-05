@@ -272,7 +272,9 @@ contract MockPrimeBroker is IPrimeBroker {
                 request.isApproved = true;
 
                 // Call the vault's approval handler to update position state
-                try LeveragedVaultImplementation(request.vault).handleBrokerApproval(requestId, request.leverageAmount) {
+                try LeveragedVaultImplementation(request.vault).handleBrokerApproval(
+                    requestId, request.leverageAmount
+                ) {
                     // Success
                 } catch Error(string memory reason) {
                     // If it fails, revert with more details
