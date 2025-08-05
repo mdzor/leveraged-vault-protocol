@@ -27,7 +27,7 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
     mapping(bytes32 => LeverageRequest) public requests;
     mapping(address => uint256) public suppliedAssets;
     mapping(address => uint256) public borrowedAssets;
-    
+
     bytes32[] public allRequestIds;
     uint256 private requestNonce;
     uint256 public constant HEALTH_FACTOR_PRECISION = 1e18;
@@ -220,25 +220,25 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
      */
     function getPendingRequests() external view returns (bytes32[] memory) {
         uint256 pendingCount = 0;
-        
+
         // Count pending requests
         for (uint256 i = 0; i < allRequestIds.length; i++) {
             if (!requests[allRequestIds[i]].isProcessed) {
                 pendingCount++;
             }
         }
-        
+
         // Create array of pending request IDs
         bytes32[] memory pendingRequests = new bytes32[](pendingCount);
         uint256 currentIndex = 0;
-        
+
         for (uint256 i = 0; i < allRequestIds.length; i++) {
             if (!requests[allRequestIds[i]].isProcessed) {
                 pendingRequests[currentIndex] = allRequestIds[i];
                 currentIndex++;
             }
         }
-        
+
         return pendingRequests;
     }
 

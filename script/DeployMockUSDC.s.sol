@@ -20,10 +20,10 @@ contract DeployMockUSDC is Script {
 
         // Deploy mock USDC
         MockUSDC usdc = new MockUSDC();
-        
+
         // Mint 1M USDC to deployer for testing
         usdc.mint(deployer, 1000000e6);
-        
+
         vm.stopBroadcast();
 
         console.log("\n=== MOCK USDC DEPLOYED ===");

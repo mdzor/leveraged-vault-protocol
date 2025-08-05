@@ -33,7 +33,7 @@ contract CreateNewVault is Script {
             oracle: address(0),
             irm: address(0),
             lltv: 800000000000000000 // 80% LTV
-        });
+         });
 
         // Create vault configuration
         LeveragedVaultImplementation.VaultConfig memory vaultConfig = LeveragedVaultImplementation
