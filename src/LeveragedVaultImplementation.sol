@@ -44,8 +44,6 @@ error InvalidCalculation();
 
 /**
  * @title LeveragedVaultImplementation
- * @dev Individual vault implementation for leveraged fund exposure with ERC3643 synthetic tokens
- * Deployed by VaultFactory for each specific fund/configuration
  */
 contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -109,12 +107,13 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     VaultConfig public vaultConfig;
-    address public immutable factory;
+    address public factory;
     uint256 public nextPositionId = 1;
     uint256 public totalValueLocked;
     uint256 public totalBorrowed;
     uint256 public lastValidPrice;
     uint256 public lastPriceUpdate;
+    bool private _initialized;
 
     mapping(uint256 => Position) public positions;
     mapping(uint256 => ExecutedPositionData) public executedPositions;
@@ -188,6 +187,11 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         _;
     }
 
+    modifier onlyInitialized() {
+        if (!_initialized) revert("Not initialized");
+        _;
+    }
+
     modifier onlyBroker() {
         if (msg.sender != address(vaultConfig.primeBroker)) {
             revert OnlyBrokerCanCall();
@@ -213,16 +217,21 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         _;
     }
 
-    constructor() Ownable(msg.sender) {
-        factory = msg.sender;
+    constructor() Ownable(address(1)) {
+        _initialized = true;
     }
 
     /**
-     * @dev Initialize the vault with configuration (called by factory)
      * @param _config Vault configuration
      * @param _owner Owner of the vault
      */
-    function initialize(VaultConfig memory _config, address _owner) external onlyFactory {
+    function initialize(VaultConfig memory _config, address _owner) external {
+        if (_initialized) revert("Already initialized");
+        if (msg.sender == address(0)) revert InvalidZeroAddress();
+
+        factory = msg.sender;
+        _initialized = true;
+        nextPositionId = 1;
         if (_owner == address(0)) revert InvalidZeroAddress();
         if (address(_config.depositToken) == address(0)) revert InvalidZeroAddress();
         if (address(_config.primeBroker) == address(0)) revert InvalidZeroAddress();
@@ -243,7 +252,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Request a new leveraged position (Step 1: Submit to broker)
      * @param amount Amount of deposit token to invest
      * @param leverageRatio Desired leverage (150 = 1.5x, 300 = 3x, etc.)
      * @return positionId The ID of the newly created position (in Pending state)
@@ -252,6 +260,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         external
         nonReentrant
         whenNotPaused
+        onlyInitialized
         validLeverage(leverageRatio)
         returns (uint256 positionId)
     {
@@ -263,10 +272,8 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             revert InsufficientAllowance();
         }
 
-        // Transfer deposit from user (held in vault until broker approval)
         vaultConfig.depositToken.safeTransferFrom(msg.sender, address(this), amount);
 
-        // Submit request to broker first
         uint256 requestedLeverageAmount =
             LeverageCalculator.calculateBorrowAmount(amount, leverageRatio);
         bytes32 brokerRequestId = vaultConfig.primeBroker.requestLeverage(
@@ -302,13 +309,13 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Handle broker approval (Step 2: Broker approves request)
      * @param brokerRequestId The broker's request ID
      * @param approvedAmount Amount approved by broker (may differ from requested)
      */
     function handleBrokerApproval(bytes32 brokerRequestId, uint256 approvedAmount)
         external
         onlyBroker
+        onlyInitialized
     {
         if (brokerRequestId == bytes32(0)) revert InvalidRequestId();
         if (approvedAmount == 0) revert AmountMustBePositive();
@@ -333,13 +340,13 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Handle broker rejection (Step 2: Broker rejects request)
      * @param brokerRequestId The broker's request ID
      * @param reason Rejection reason
      */
     function handleBrokerRejection(bytes32 brokerRequestId, string calldata reason)
         external
         onlyBroker
+        onlyInitialized
     {
         if (brokerRequestId == bytes32(0)) revert InvalidRequestId();
         if (bytes(reason).length == 0) revert ReasonCannotBeEmpty();
@@ -353,7 +360,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         uint8 oldState = position.state;
         position.state = uint8(PositionState.Rejected);
 
-        // Return deposited funds to user
         vaultConfig.depositToken.safeTransfer(position.user, position.depositAmount);
 
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Rejected);
@@ -361,12 +367,12 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Execute approved leverage position (Step 3: User executes after approval)
      * @param positionId The position to execute
      */
     function executeLeveragePosition(uint256 positionId)
         external
         nonReentrant
+        onlyInitialized
         positionExists(positionId)
         onlyPositionOwner(positionId)
         validPositionState(positionId, PositionState.Approved)
@@ -394,10 +400,8 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         totalValueLocked = newTVL;
         totalBorrowed = newBorrowed;
 
-        try config.primeBroker.borrow(address(config.depositToken), approvedAmount) {
-            // Success - continue
-        } catch {
-            // Revert state changes on failure
+        try config.primeBroker.borrow(address(config.depositToken), approvedAmount) { }
+        catch {
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -418,7 +422,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
                 fundTokensReceived >= minFundTokens, "Slippage: insufficient fund tokens received"
             );
         } catch {
-            // Revert state changes on failure
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -430,9 +433,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         IERC20(config.fundToken).approve(address(config.morpho), fundTokensReceived);
         try config.morpho.supplyCollateral(
             config.morphoMarket, fundTokensReceived, address(this), ""
-        ) {
-            // Success - continue
-        } catch {
+        ) { } catch {
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -441,9 +442,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
 
         try config.morpho.borrow(
             config.morphoMarket, approvedAmount, 0, address(this), address(this)
-        ) {
-            // Success - continue
-        } catch {
+        ) { } catch {
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -451,9 +450,8 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         }
 
         config.depositToken.approve(address(config.primeBroker), approvedAmount);
-        try config.primeBroker.repay(address(config.depositToken), approvedAmount) {
-            // Success - continue
-        } catch {
+        try config.primeBroker.repay(address(config.depositToken), approvedAmount) { }
+        catch {
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -463,9 +461,8 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         uint256 syntheticTokens =
             LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, leverageRatio);
 
-        try config.syntheticToken.mint(positionUser, syntheticTokens) {
-            // Success - continue
-        } catch {
+        try config.syntheticToken.mint(positionUser, syntheticTokens) { }
+        catch {
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
@@ -476,68 +473,58 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             syntheticTokensMinted: syntheticTokens,
             fundTokensOwned: fundTokensReceived,
             borrowedAmount: approvedAmount,
-            brokerRequestId: bytes32(0) // Can be retrieved from events if needed
-         });
+            brokerRequestId: bytes32(0)
+        });
 
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Executed);
         emit PositionExecuted(positionId, positionUser, fundTokensReceived, syntheticTokens);
     }
 
     /**
-     * @dev Check and handle expired positions (called by anyone)
      * @param positionId The position to check for expiry
      */
     function checkPositionExpiry(uint256 positionId) external positionExists(positionId) {
         Position storage position = positions[positionId];
 
-        // Calculate execution deadline dynamically instead of storing it
         uint8 currentState = position.state;
         if (currentState == uint8(PositionState.Approved)) {
             uint256 executionDeadline = position.createdAt + BROKER_TIMEOUT;
 
             if (block.timestamp > executionDeadline) {
-                // CEI Pattern: Effects first - update state before external interactions
                 position.state = uint8(PositionState.Expired);
 
-                // Cache user data before external call
                 address positionUser = position.user;
                 uint256 depositAmount = position.depositAmount;
 
-                // CEI Pattern: Interactions last - external call after state changes
                 vaultConfig.depositToken.safeTransfer(positionUser, depositAmount);
 
                 emit PositionStateChanged(
                     positionId, PositionState(currentState), PositionState.Expired
                 );
-                emit PositionExpired(positionId, bytes32(positionId)); // Use positionId as identifier
+                emit PositionExpired(positionId, bytes32(positionId));
             }
         }
     }
 
     /**
-     * @dev Batch check multiple positions for expiry (gas efficient)
      * @param positionIds Array of position IDs to check
      */
     function batchCheckPositionExpiry(uint256[] calldata positionIds) external {
         for (uint256 i = 0; i < positionIds.length; i++) {
             uint256 positionId = positionIds[i];
             if (positions[positionId].user != address(0)) {
-                // Position exists
                 Position storage position = positions[positionId];
 
                 if (position.state == uint8(PositionState.Approved)) {
                     uint256 executionDeadline = position.createdAt + BROKER_TIMEOUT;
 
                     if (block.timestamp > executionDeadline) {
-                        // CEI Pattern: Effects first
                         uint8 oldState = position.state;
                         position.state = uint8(PositionState.Expired);
 
-                        // Cache data
                         address positionUser = position.user;
                         uint256 depositAmount = position.depositAmount;
 
-                        // CEI Pattern: Interactions last
                         vaultConfig.depositToken.safeTransfer(positionUser, depositAmount);
 
                         emit PositionStateChanged(
@@ -551,12 +538,12 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Close a leveraged position (Step 4: Complete the loan repayment cycle)
      * @param positionId The position to close
      */
     function closePosition(uint256 positionId)
         external
         nonReentrant
+        onlyInitialized
         positionExists(positionId)
         onlyPositionOwner(positionId)
         validPositionState(positionId, PositionState.Executed)
@@ -564,46 +551,32 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         Position storage position = positions[positionId];
         ExecutedPositionData memory executedData = executedPositions[positionId];
 
-        // Calculate lock expiry dynamically with maximum bounds check
         uint256 lockUntil = position.createdAt + position.lockDuration;
         if (block.timestamp < lockUntil) revert PositionStillLocked();
 
-        // Additional safety: ensure position hasn't been locked for too long (prevent permanent locks)
         uint256 maxLockUntil = position.createdAt + MAX_LOCK_PERIOD;
-        if (lockUntil > maxLockUntil) {
-            // Allow closure if lock period exceeds maximum allowed
-            // This prevents positions from being permanently locked
-        }
+        if (lockUntil > maxLockUntil) { }
 
-        // Cache frequently accessed storage variables
         VaultConfig memory config = vaultConfig;
 
-        // Burn synthetic tokens from user
-        try config.syntheticToken.burn(msg.sender, executedData.syntheticTokensMinted) {
-            // Success - continue
-        } catch {
+        try config.syntheticToken.burn(msg.sender, executedData.syntheticTokensMinted) { }
+        catch {
             revert("Failed to burn synthetic tokens");
         }
 
-        // First, withdraw some fund tokens from Morpho to get USDC for repayment
         uint256 repayAmount = executedData.borrowedAmount;
         uint256 fundTokensToRedeem =
             _calculateFundTokensToRedeem(executedData.fundTokensOwned, repayAmount);
 
-        // Withdraw the fund tokens we need to redeem from Morpho
         try config.morpho.withdrawCollateral(
             config.morphoMarket, fundTokensToRedeem, address(this), address(this)
-        ) {
-            // Success - continue
-        } catch {
+        ) { } catch {
             revert("Failed to withdraw collateral from Morpho");
         }
 
-        // Calculate minimum USDC expected for slippage protection
         uint256 expectedUSDC = _getExpectedUSDCFromFundTokens(fundTokensToRedeem);
-        uint256 minUSDCFromRedeem = (expectedUSDC * 9950) / 10000; // 0.5% slippage tolerance
+        uint256 minUSDCFromRedeem = (expectedUSDC * 9950) / 10000;
 
-        // Redeem those fund tokens for USDC with slippage protection
         uint256 underlyingReceived;
         try IERC3643Fund(config.fundToken).redeem(fundTokensToRedeem) returns (uint256 amount) {
             underlyingReceived = amount;
@@ -615,29 +588,22 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             revert("Failed to redeem fund tokens");
         }
 
-        // Repay borrowed USDC to Morpho Blue
         config.depositToken.approve(address(config.morpho), repayAmount);
-        try config.morpho.repay(config.morphoMarket, repayAmount, 0, address(this), "") {
-            // Success - continue
-        } catch {
+        try config.morpho.repay(config.morphoMarket, repayAmount, 0, address(this), "") { }
+        catch {
             revert("Failed to repay Morpho loan");
         }
 
-        // Withdraw remaining fund tokens from Morpho as collateral
         uint256 remainingCollateral = executedData.fundTokensOwned - fundTokensToRedeem;
         try config.morpho.withdrawCollateral(
             config.morphoMarket, remainingCollateral, address(this), address(this)
-        ) {
-            // Success - continue
-        } catch {
+        ) { } catch {
             revert("Failed to withdraw remaining collateral from Morpho");
         }
 
-        // Calculate minimum USDC expected for remaining redemption
         uint256 expectedRemainingUSDC = _getExpectedUSDCFromFundTokens(remainingCollateral);
-        uint256 minRemainingUSDC = (expectedRemainingUSDC * 9950) / 10000; // 0.5% slippage tolerance
+        uint256 minRemainingUSDC = (expectedRemainingUSDC * 9950) / 10000;
 
-        // Redeem remaining fund tokens for USDC with slippage protection
         uint256 remainingUSDC;
         try IERC3643Fund(config.fundToken).redeem(remainingCollateral) returns (uint256 amount) {
             remainingUSDC = amount;
@@ -649,31 +615,24 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             revert("Failed to redeem remaining fund tokens");
         }
 
-        // Calculate total USDC available (remaining from repayment + remaining from collateral)
-        // Safe arithmetic with underflow/overflow checks
         if (underlyingReceived < repayAmount) revert ArithmeticUnderflow();
         uint256 remainingFromRepayment = underlyingReceived - repayAmount;
         uint256 totalUSDCAvailable = remainingFromRepayment + remainingUSDC;
         if (totalUSDCAvailable < remainingFromRepayment) revert ArithmeticOverflow();
 
-        // Calculate P&L (profit/loss vs original deposit) with safe arithmetic
         uint256 pnl = 0;
         if (totalUSDCAvailable > position.depositAmount) {
             pnl = totalUSDCAvailable - position.depositAmount;
-            // Additional check to ensure calculation is valid
             if (pnl > totalUSDCAvailable) revert InvalidCalculation();
         }
 
-        // Charge fees on profits with underflow check
         uint256 fees = _calculateAndChargeFees(position, executedData, pnl, config);
         if (totalUSDCAvailable < fees) revert ArithmeticUnderflow();
         uint256 finalAmount = totalUSDCAvailable - fees;
 
-        // CEI Pattern: Effects first - update all state before external interactions
         uint8 oldState = position.state;
         position.state = uint8(PositionState.Completed);
 
-        // Update vault totals with underflow checks
         uint256 totalToSubtract = position.depositAmount + executedData.borrowedAmount;
         if (totalToSubtract < position.depositAmount) revert ArithmeticOverflow();
         if (totalValueLocked < totalToSubtract) revert ArithmeticUnderflow();
@@ -682,26 +641,22 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         totalValueLocked -= totalToSubtract;
         totalBorrowed -= executedData.borrowedAmount;
 
-        // Clean up executed position data
         delete executedPositions[positionId];
 
-        // Cache user address for events and transfer
         address positionUser = msg.sender;
 
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Completed);
         emit PositionClosed(positionId, positionUser, finalAmount, pnl);
 
-        // CEI Pattern: Interactions last - return funds to user after all state updates
         if (finalAmount > 0) {
             config.depositToken.safeTransfer(positionUser, finalAmount);
         }
     }
 
     /**
-     * @dev Update vault configuration (only owner)
      * @param newConfig New vault configuration
      */
-    function updateVaultConfig(VaultConfig memory newConfig) external onlyOwner {
+    function updateVaultConfig(VaultConfig memory newConfig) external onlyOwner onlyInitialized {
         if (address(newConfig.depositToken) == address(0)) revert InvalidZeroAddress();
         if (address(newConfig.primeBroker) == address(0)) revert InvalidZeroAddress();
         if (address(newConfig.morpho) == address(0)) revert InvalidZeroAddress();
@@ -720,8 +675,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         emit ConfigUpdated(newConfig);
     }
 
-    // Internal helper functions
-
     function _getExpectedFundTokens(uint256 usdcAmount) internal view returns (uint256) {
         uint256 sharePrice = _getValidatedPrice();
         return (usdcAmount * 1e18) / sharePrice;
@@ -735,10 +688,8 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     function _getValidatedPrice() internal view returns (uint256) {
         uint256 currentPrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
 
-        // Check if price is valid (non-zero)
         if (currentPrice == 0) revert OraclePriceInvalid();
 
-        // If we have a previous valid price, check for extreme deviations
         if (lastValidPrice > 0) {
             uint256 deviation;
             if (currentPrice > lastValidPrice) {
@@ -747,7 +698,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
                 deviation = ((lastValidPrice - currentPrice) * BASIS_POINTS) / lastValidPrice;
             }
 
-            // Revert if price deviation exceeds maximum allowed
             if (deviation > MAX_PRICE_DEVIATION) revert PriceDeviationTooHigh();
         }
 
@@ -775,23 +725,19 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         uint256 managementFee = 0;
         uint256 performanceFee = 0;
 
-        // Calculate management fee (time-based) with underflow check
         if (block.timestamp < position.createdAt) revert ArithmeticUnderflow();
         uint256 timeHeld = block.timestamp - position.createdAt;
         managementFee = LeverageCalculator.calculateManagementFee(
             position.depositAmount, config.managementFee, timeHeld
         );
 
-        // Calculate performance fee (profit-based)
         if (pnl > 0) {
             performanceFee = LeverageCalculator.calculatePerformanceFee(pnl, config.performanceFee);
         }
 
-        // Safe addition for fee calculation
         totalFees = managementFee + performanceFee;
         if (totalFees < managementFee) revert ArithmeticOverflow();
 
-        // Transfer fees to recipient with zero address check
         if (totalFees > 0) {
             if (config.feeRecipient == address(0)) revert InvalidZeroAddress();
             config.depositToken.safeTransfer(config.feeRecipient, totalFees);
@@ -800,7 +746,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         return totalFees;
     }
 
-    // View functions
     function getPosition(uint256 positionId)
         external
         view
@@ -840,7 +785,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         return (positions_page, totalCount, hasMore);
     }
 
-    // Legacy function for backward compatibility - limited to first 50 positions
     function getUserPositions(address user) external view returns (uint256[] memory) {
         (uint256[] memory positions_page,,) = this.getUserPositions(user, 0, 50);
         return positions_page;
@@ -856,7 +800,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
 
         ExecutedPositionData memory executedData = executedPositions[positionId];
 
-        // Get current fund token price with validation
         uint256 currentPrice = _getValidatedPrice();
         uint256 fundValue = (executedData.fundTokensOwned * currentPrice) / 1e18;
 
@@ -872,21 +815,23 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         return (vaultConfig, totalValueLocked, totalBorrowed);
     }
 
-    // Emergency functions
-    function pause() external onlyOwner {
+    function pause() external onlyOwner onlyInitialized {
         _pause();
     }
 
-    function unpause() external onlyOwner {
+    function unpause() external onlyOwner onlyInitialized {
         _unpause();
     }
 
+    function isInitialized() external view returns (bool) {
+        return _initialized;
+    }
+
     /**
-     * @dev Emergency withdraw with restrictions to prevent abuse
+     * Emergency withdraw with restrictions to prevent abuse
      * Can only withdraw non-deposit tokens to prevent draining user funds
      */
-    function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
-        // Prevent withdrawal of the main deposit token to protect user funds
+    function emergencyWithdraw(address token, uint256 amount) external onlyOwner onlyInitialized {
         if (token == address(vaultConfig.depositToken)) {
             revert("Cannot withdraw deposit tokens");
         }

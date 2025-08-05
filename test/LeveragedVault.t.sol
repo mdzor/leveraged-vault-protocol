@@ -272,12 +272,14 @@ contract MockPrimeBroker is IPrimeBroker {
                 request.isApproved = true;
 
                 // Call the vault's approval handler to update position state
-                (bool success,) = request.vault.call(
-                    abi.encodeWithSignature(
-                        "handleBrokerApproval(bytes32,uint256)", requestId, request.leverageAmount
-                    )
-                );
-                require(success, "Vault approval call failed");
+                try LeveragedVaultImplementation(request.vault).handleBrokerApproval(requestId, request.leverageAmount) {
+                    // Success
+                } catch Error(string memory reason) {
+                    // If it fails, revert with more details
+                    revert(string(abi.encodePacked("Vault approval call failed: ", reason)));
+                } catch {
+                    revert("Vault approval call failed: unknown error");
+                }
             }
         }
     }

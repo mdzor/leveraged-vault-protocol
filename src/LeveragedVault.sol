@@ -4,15 +4,18 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/proxy/Clones.sol";
 import "./LeveragedVaultImplementation.sol";
 
 /**
  * @title LeveragedVaultFactory
- * Factory contract for deploying individual leveraged vaults
+ * Factory contract for deploying individual leveraged vaults using EIP-1167 clones
  * Each vault targets a specific ERC3643 fund with configurable parameters
  */
 contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
+    using Clones for address;
     // Vault tracking
+
     struct VaultInfo {
         address vaultAddress;
         address fundToken;
@@ -24,6 +27,7 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     // State variables
+    address public immutable implementation;
     uint256 public nextVaultId = 1;
     uint256 public totalVaultsCreated;
 
@@ -39,7 +43,8 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         address indexed owner,
         address fundToken,
         string name,
-        string symbol
+        string symbol,
+        address implementation
     );
 
     event VaultStatusChanged(uint256 indexed vaultId, address indexed vaultAddress, bool isActive);
@@ -52,7 +57,7 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     }
 
     constructor() Ownable(msg.sender) {
-        // Factory constructor
+        implementation = address(new LeveragedVaultImplementation());
     }
 
     /**
@@ -70,8 +75,9 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         require(config.maxLeverage >= 150 && config.maxLeverage <= 500, "Invalid max leverage");
         require(config.feeRecipient != address(0), "Invalid fee recipient");
 
-        // Deploy new vault implementation
-        LeveragedVaultImplementation newVault = new LeveragedVaultImplementation();
+        // Deploy new vault clone
+        address vaultClone = implementation.clone();
+        LeveragedVaultImplementation newVault = LeveragedVaultImplementation(vaultClone);
 
         // Initialize the vault
         newVault.initialize(config, msg.sender);
@@ -104,7 +110,8 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
             msg.sender,
             config.fundToken,
             config.vaultName,
-            config.vaultSymbol
+            config.vaultSymbol,
+            implementation
         );
     }
 
@@ -215,6 +222,10 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
 
     function getTotalVaultsCreated() external view returns (uint256) {
         return totalVaultsCreated;
+    }
+
+    function getImplementation() external view returns (address) {
+        return implementation;
     }
 
     function getFactoryStats()
