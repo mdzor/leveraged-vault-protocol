@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -475,7 +474,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         if (newTVL < totalValueLocked) revert ArithmeticOverflow();
         uint256 newBorrowed = totalBorrowed + approvedAmount;
         if (newBorrowed < totalBorrowed) revert ArithmeticOverflow();
-        
+
         totalValueLocked = newTVL;
         totalBorrowed = newBorrowed;
 
@@ -498,7 +497,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             if (block.timestamp > executionDeadline) {
                 // CEI Pattern: Effects first - update state before external interactions
                 position.state = uint8(PositionState.Expired);
-                
+
                 // Cache user data before external call
                 address positionUser = position.user;
                 uint256 depositAmount = position.depositAmount;
@@ -521,17 +520,18 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     function batchCheckPositionExpiry(uint256[] calldata positionIds) external {
         for (uint256 i = 0; i < positionIds.length; i++) {
             uint256 positionId = positionIds[i];
-            if (positions[positionId].user != address(0)) { // Position exists
+            if (positions[positionId].user != address(0)) {
+                // Position exists
                 Position storage position = positions[positionId];
-                
+
                 if (position.state == uint8(PositionState.Approved)) {
                     uint256 executionDeadline = position.createdAt + BROKER_TIMEOUT;
-                    
+
                     if (block.timestamp > executionDeadline) {
                         // CEI Pattern: Effects first
                         uint8 oldState = position.state;
                         position.state = uint8(PositionState.Expired);
-                        
+
                         // Cache data
                         address positionUser = position.user;
                         uint256 depositAmount = position.depositAmount;
@@ -566,7 +566,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         // Calculate lock expiry dynamically with maximum bounds check
         uint256 lockUntil = position.createdAt + position.lockDuration;
         if (block.timestamp < lockUntil) revert PositionStillLocked();
-        
+
         // Additional safety: ensure position hasn't been locked for too long (prevent permanent locks)
         uint256 maxLockUntil = position.createdAt + MAX_LOCK_PERIOD;
         if (lockUntil > maxLockUntil) {
@@ -677,7 +677,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         if (totalToSubtract < position.depositAmount) revert ArithmeticOverflow();
         if (totalValueLocked < totalToSubtract) revert ArithmeticUnderflow();
         if (totalBorrowed < executedData.borrowedAmount) revert ArithmeticUnderflow();
-        
+
         totalValueLocked -= totalToSubtract;
         totalBorrowed -= executedData.borrowedAmount;
 
@@ -730,10 +730,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
 
     function _getValidatedPrice() internal view returns (uint256) {
         uint256 currentPrice = IERC3643Fund(vaultConfig.fundToken).getSharePrice();
-        
+
         // Check if price is valid (non-zero)
         if (currentPrice == 0) revert OraclePriceInvalid();
-        
+
         // If we have a previous valid price, check for extreme deviations
         if (lastValidPrice > 0) {
             uint256 deviation;
@@ -742,11 +742,11 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             } else {
                 deviation = ((lastValidPrice - currentPrice) * BASIS_POINTS) / lastValidPrice;
             }
-            
+
             // Revert if price deviation exceeds maximum allowed
             if (deviation > MAX_PRICE_DEVIATION) revert PriceDeviationTooHigh();
         }
-        
+
         return currentPrice;
     }
 
@@ -767,7 +767,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
 
     function _calculateAndChargeFees(
         Position memory position,
-        ExecutedPositionData memory /* executedData */,
+        ExecutedPositionData memory,
         uint256 pnl,
         VaultConfig memory config
     ) internal returns (uint256 totalFees) {
