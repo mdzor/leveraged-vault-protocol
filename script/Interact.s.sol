@@ -72,8 +72,7 @@ contract Interact is Script {
         console.log("Created position with ID:", positionId);
 
         // Get position data for broker request ID tracking
-        (LeveragedVaultImplementation.Position memory position,) =
-            LeveragedVaultImplementation(vault).getPosition(positionId);
+        LeveragedVaultImplementation(vault).getPosition(positionId);
 
         // Note: brokerRequestId would need to be retrieved from events or stored separately
         bytes32 brokerRequestId = bytes32(positionId); // Simplified for now

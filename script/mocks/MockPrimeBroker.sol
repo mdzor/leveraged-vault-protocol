@@ -80,19 +80,14 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
     /**
      * @dev Get user's health factor
      */
-    function getHealthFactor(address user) external view override returns (uint256) {
+    function getHealthFactor(address) external view override returns (uint256) {
         return defaultHealthFactor; // Simplified for mock
     }
 
     /**
      * @dev Get available borrow amount for user
      */
-    function getAvailableBorrow(address user, address asset)
-        external
-        view
-        override
-        returns (uint256)
-    {
+    function getAvailableBorrow(address, address asset) external view override returns (uint256) {
         return IERC20(asset).balanceOf(address(this)) / 2; // 50% of liquidity available
     }
 

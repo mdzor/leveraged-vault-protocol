@@ -31,7 +31,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     mapping(uint256 => VaultInfo) public vaults;
     mapping(address => uint256[]) public userVaults; // vaults created by user
     mapping(address => uint256) public vaultIdByAddress; // vault address => vault ID
-    mapping(address => bool) public isValidVault; // quick check for valid vaults
 
     // Events
     event VaultCreated(
@@ -95,7 +94,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         // Update mappings
         userVaults[msg.sender].push(vaultId);
         vaultIdByAddress[address(newVault)] = vaultId;
-        isValidVault[address(newVault)] = true;
         unchecked {
             totalVaultsCreated++;
         }
@@ -118,7 +116,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         require(vault.owner == msg.sender, "Not vault owner");
 
         vault.isActive = false;
-        isValidVault[vault.vaultAddress] = false;
 
         emit VaultStatusChanged(vaultId, vault.vaultAddress, false);
     }
@@ -133,7 +130,6 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         require(!vault.isActive, "Vault is already active");
 
         vault.isActive = true;
-        isValidVault[vault.vaultAddress] = true;
 
         emit VaultStatusChanged(vaultId, vault.vaultAddress, true);
     }

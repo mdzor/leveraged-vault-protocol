@@ -22,7 +22,6 @@ contract Manage is Script {
         address vaultFactory = vm.envAddress("VAULT_FACTORY");
         address usdc = vm.envAddress("USDC");
         address primeBroker = vm.envAddress("PRIME_BROKER");
-        address syntheticToken = vm.envAddress("SYNTHETIC_TOKEN");
         address mockFund = vm.envAddress("MOCK_FUND");
         uint256 vaultId = vm.envUint("VAULT_ID");
 
@@ -76,7 +75,7 @@ contract Manage is Script {
         for (uint256 i = 1; i <= 10; i++) {
             try LeveragedVaultImplementation(vault).getPosition(i) returns (
                 LeveragedVaultImplementation.Position memory position,
-                LeveragedVaultImplementation.ExecutedPositionData memory executedData
+                LeveragedVaultImplementation.ExecutedPositionData memory /* executedData */
             ) {
                 if (position.user != address(0)) {
                     printPositionSummary(vault, i, position);
@@ -110,7 +109,6 @@ contract Manage is Script {
      * @dev Approve all pending leverage requests (admin function)
      */
     function approveAllPendingRequests() external {
-        address primeBroker = vm.envAddress("PRIME_BROKER");
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
 
         vm.startBroadcast(deployerPrivateKey);
@@ -255,7 +253,7 @@ contract Manage is Script {
     /**
      * @dev Get gas estimates for common operations
      */
-    function getGasEstimates() external {
+    function getGasEstimates() external pure {
         console.log("=== GAS ESTIMATES ===");
         console.log("Deployment Costs:");
         console.log("- Vault Factory: ~2,500,000 gas");

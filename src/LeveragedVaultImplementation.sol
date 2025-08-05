@@ -277,13 +277,10 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             leverageRatio
         );
 
-        // CEI Pattern: Effects first - update state before external calls
         positionId = nextPositionId;
-        // Safe increment with overflow check
         if (nextPositionId >= type(uint256).max) revert ArithmeticOverflow();
-        nextPositionId++; // SSTORE 1
+        nextPositionId++;
 
-        // Store minimal position data - only 2 storage slots
         positions[positionId] = Position({
             depositAmount: uint128(amount),
             createdAt: uint64(block.timestamp),
@@ -292,15 +289,13 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             state: uint8(PositionState.Pending),
             flags: 0,
             user: msg.sender,
-            executionData: 0 // Will be set later if needed
-         }); // SSTORE 2 (2 slots)
+            executionData: 0
+        });
 
-        brokerRequestToPosition[brokerRequestId] = positionId; // SSTORE 3
+        brokerRequestToPosition[brokerRequestId] = positionId;
 
-        // Add to user positions for tracking (only if needed)
-        userPositions[msg.sender].push(positionId); // SSTORE 4 - but only grows array
+        userPositions[msg.sender].push(positionId);
 
-        // Use events for historical tracking instead of storage
         emit PositionRequested(
             positionId, msg.sender, brokerRequestId, amount, leverageRatio, requestedLeverageAmount
         );
@@ -324,18 +319,14 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         Position storage position = positions[positionId];
         if (position.state != uint8(PositionState.Pending)) revert PositionNotPending();
 
-        // Update position state only - store approved amount in executionData
         uint8 oldState = position.state;
         position.state = uint8(PositionState.Approved);
 
-        // Pack approved amount into executionData (12 bytes = 96 bits, enough for amounts)
         if (approvedAmount <= type(uint96).max) {
             position.executionData = uint96(approvedAmount);
         } else {
-            revert InvalidAmount(); // Amount too large for packed storage
+            revert InvalidAmount();
         }
-
-        // No need to store execution deadline - use block.timestamp + BROKER_TIMEOUT in view functions
 
         emit PositionStateChanged(positionId, PositionState(oldState), PositionState.Approved);
         emit PositionApproved(positionId, brokerRequestId, approvedAmount);
@@ -383,22 +374,18 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
     {
         Position storage position = positions[positionId];
 
-        // CEI Pattern: Effects First - Update state before any external calls
         uint8 oldState = position.state;
-        position.state = uint8(PositionState.Executed); // Prevent re-execution
+        position.state = uint8(PositionState.Executed);
 
-        // Cache frequently accessed storage variables
         VaultConfig memory config = vaultConfig;
-        uint256 approvedAmount = position.executionData; // Get approved amount from packed data
+        uint256 approvedAmount = position.executionData;
         uint256 depositAmount = position.depositAmount;
-        address positionUser = position.user; // Cache user address
-        uint16 leverageRatio = position.leverageRatio; // Cache leverage ratio
+        address positionUser = position.user;
+        uint16 leverageRatio = position.leverageRatio;
 
-        // Safe addition with overflow check
         uint256 totalInvestAmount = depositAmount + approvedAmount;
         if (totalInvestAmount < depositAmount) revert ArithmeticOverflow();
 
-        // Update vault totals early with overflow checks
         uint256 newTVL = totalValueLocked + totalInvestAmount;
         if (newTVL < totalValueLocked) revert ArithmeticOverflow();
         uint256 newBorrowed = totalBorrowed + approvedAmount;
@@ -407,8 +394,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         totalValueLocked = newTVL;
         totalBorrowed = newBorrowed;
 
-        // CEI Pattern: Interactions Last - All external calls after state updates
-        // Get leverage funds from broker (broker provides the leverage)
         try config.primeBroker.borrow(address(config.depositToken), approvedAmount) {
             // Success - continue
         } catch {
@@ -419,13 +404,11 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             revert("Failed to borrow from prime broker");
         }
 
-        // Get expected fund tokens for slippage protection with zero check
         if (totalInvestAmount == 0) revert InvalidAmount();
         uint256 expectedFundTokens = _getExpectedFundTokens(totalInvestAmount);
         if (expectedFundTokens == 0) revert InvalidCalculation();
-        uint256 minFundTokens = (expectedFundTokens * 9950) / 10000; // 0.5% slippage tolerance
+        uint256 minFundTokens = (expectedFundTokens * 9950) / 10000;
 
-        // Invest in fund with slippage protection and zero address check
         if (config.fundToken == address(0)) revert InvalidZeroAddress();
         config.depositToken.approve(config.fundToken, totalInvestAmount);
         uint256 fundTokensReceived;
@@ -442,7 +425,6 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
             revert("Failed to invest in fund");
         }
 
-        // Supply fund tokens as collateral to Morpho Blue with zero checks
         if (fundTokensReceived == 0) revert InvalidAmount();
         if (address(config.morpho) == address(0)) revert InvalidZeroAddress();
         IERC20(config.fundToken).approve(address(config.morpho), fundTokensReceived);
@@ -451,54 +433,45 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         ) {
             // Success - continue
         } catch {
-            // Revert state changes on failure
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
             revert("Failed to supply collateral to Morpho");
         }
 
-        // Borrow USDC from Morpho against the collateral
         try config.morpho.borrow(
             config.morphoMarket, approvedAmount, 0, address(this), address(this)
         ) {
             // Success - continue
         } catch {
-            // Revert state changes on failure
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
             revert("Failed to borrow from Morpho");
         }
 
-        // Immediately repay Prime Broker to achieve zero debt (per spec requirement)
         config.depositToken.approve(address(config.primeBroker), approvedAmount);
         try config.primeBroker.repay(address(config.depositToken), approvedAmount) {
             // Success - continue
         } catch {
-            // Revert state changes on failure
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
             revert("Failed to repay prime broker");
         }
 
-        // Calculate synthetic tokens
         uint256 syntheticTokens =
             LeverageCalculator.calculateSyntheticTokens(fundTokensReceived, leverageRatio);
 
-        // Mint synthetic tokens to user
         try config.syntheticToken.mint(positionUser, syntheticTokens) {
             // Success - continue
         } catch {
-            // Revert state changes on failure
             position.state = oldState;
             totalValueLocked -= totalInvestAmount;
             totalBorrowed -= approvedAmount;
             revert("Failed to mint synthetic tokens");
         }
 
-        // Store execution data separately - only when fully executed
         executedPositions[positionId] = ExecutedPositionData({
             syntheticTokensMinted: syntheticTokens,
             fundTokensOwned: fundTokensReceived,
@@ -789,10 +762,7 @@ contract LeveragedVaultImplementation is Ownable, ReentrancyGuard, Pausable {
         uint256 fundTokenPrice = _getValidatedPrice();
         uint256 fundTokensNeeded = (usdcNeeded * 1e18) / fundTokenPrice;
 
-        // Add a small buffer (0.1%) to account for rounding and ensure we get enough USDC
         fundTokensNeeded = (fundTokensNeeded * 1001) / 1000;
-
-        // Ensure we don't try to redeem more than we have
         return fundTokensNeeded > totalFundTokens ? totalFundTokens : fundTokensNeeded;
     }
 
