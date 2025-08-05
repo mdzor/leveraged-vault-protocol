@@ -78,7 +78,10 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         newVault.initialize(config, msg.sender);
 
         // Create vault info
-        vaultId = nextVaultId++;
+        vaultId = nextVaultId;
+        unchecked {
+            nextVaultId++;
+        }
         vaults[vaultId] = VaultInfo({
             vaultAddress: address(newVault),
             fundToken: config.fundToken,
@@ -93,7 +96,9 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
         userVaults[msg.sender].push(vaultId);
         vaultIdByAddress[address(newVault)] = vaultId;
         isValidVault[address(newVault)] = true;
-        totalVaultsCreated++;
+        unchecked {
+            totalVaultsCreated++;
+        }
 
         emit VaultCreated(
             vaultId,
@@ -172,11 +177,14 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     function getAllVaults() external view returns (VaultInfo[] memory) {
         VaultInfo[] memory allVaults = new VaultInfo[](totalVaultsCreated);
         uint256 index = 0;
+        uint256 nextVaultIdCached = nextVaultId;
 
-        for (uint256 i = 1; i < nextVaultId; i++) {
-            if (vaults[i].vaultAddress != address(0)) {
-                allVaults[index] = vaults[i];
-                index++;
+        unchecked {
+            for (uint256 i = 1; i < nextVaultIdCached; ++i) {
+                if (vaults[i].vaultAddress != address(0)) {
+                    allVaults[index] = vaults[i];
+                    ++index;
+                }
             }
         }
 
@@ -194,12 +202,15 @@ contract LeveragedVaultFactory is Ownable, ReentrancyGuard {
     {
         totalCreated = totalVaultsCreated;
         nextId = nextVaultId;
+        uint256 nextVaultIdCached = nextVaultId;
 
         // Count active vaults
         activeCount = 0;
-        for (uint256 i = 1; i < nextVaultId; i++) {
-            if (vaults[i].isActive) {
-                activeCount++;
+        unchecked {
+            for (uint256 i = 1; i < nextVaultIdCached; ++i) {
+                if (vaults[i].isActive) {
+                    ++activeCount;
+                }
             }
         }
     }

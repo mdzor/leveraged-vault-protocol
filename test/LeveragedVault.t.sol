@@ -97,6 +97,7 @@ contract MockPrimeBroker is IPrimeBroker {
     }
 
     mapping(bytes32 => LeverageRequest) public leverageRequests;
+    bytes32[] public allRequestIds; // Track all request IDs
     uint256 public requestCounter = 1;
 
     constructor(MockERC20 _asset) {
@@ -134,6 +135,9 @@ contract MockPrimeBroker is IPrimeBroker {
             isProcessed: false,
             isApproved: false
         });
+
+        // Track the request ID
+        allRequestIds.push(requestId);
 
         // Don't auto-approve immediately to avoid reentrancy
         // Test will call processRequests() after the transaction
@@ -257,12 +261,26 @@ contract MockPrimeBroker is IPrimeBroker {
 
     // Process all pending requests (for testing)
     function processAllPendingRequests() external {
-        // This is a simplified approach for testing
-        // In reality, the broker would process requests asynchronously
-        for (uint256 i = 1; i < requestCounter; i++) {
-            bytes32 requestId = keccak256(abi.encodePacked("", address(0), uint256(0), i));
-            // Find the actual request ID (this is a hack for testing)
-            // In production, you'd have a proper way to iterate requests
+        // Process all pending requests by approving them
+        for (uint256 i = 0; i < allRequestIds.length; i++) {
+            bytes32 requestId = allRequestIds[i];
+            LeverageRequest storage request = leverageRequests[requestId];
+            
+            if (!request.isProcessed) {
+                // Auto-approve the request
+                request.isProcessed = true;
+                request.isApproved = true;
+                
+                // Call the vault's approval handler to update position state
+                (bool success,) = request.vault.call(
+                    abi.encodeWithSignature(
+                        "handleBrokerApproval(bytes32,uint256)", 
+                        requestId, 
+                        request.leverageAmount
+                    )
+                );
+                require(success, "Vault approval call failed");
+            }
         }
     }
 
@@ -601,16 +619,21 @@ contract LeveragedVaultFactoryTest is Test {
         LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation
             .VaultConfig({
             depositToken: usdc,
-            primeBroker: primeBroker,
-            morpho: morpho,
-            syntheticToken: syntheticToken,
-            fundToken: address(fundToken),
-            morphoMarket: morphoMarket,
             managementFee: 200, // 2% annual
             performanceFee: 2000, // 20% of profits
-            minLockPeriod: 7 days,
-            feeRecipient: treasury,
             maxLeverage: 500, // 5x max
+            minLockPeriod: uint64(7 days),
+            primeBroker: primeBroker,
+            _reserved1: 0,
+            morpho: morpho,
+            _reserved2: 0,
+            syntheticToken: syntheticToken,
+            _reserved3: 0,
+            fundToken: address(fundToken),
+            _reserved4: 0,
+            feeRecipient: treasury,
+            _reserved5: 0,
+            morphoMarket: morphoMarket,
             vaultName: "Test Vault",
             vaultSymbol: "TV"
         });
@@ -639,8 +662,14 @@ contract LeveragedVaultFactoryTest is Test {
         usdc.approve(address(testVault), type(uint256).max);
     }
 
+    // Helper function to get position state
+    function getPositionState(uint256 positionId) internal view returns (uint8) {
+        (LeveragedVaultImplementation.Position memory position,) = testVault.getPosition(positionId);
+        return position.state;
+    }
+
     // Helper function to open a position with the new async flow
-    function openPositionHelper(address user, uint256 amount, uint256 leverageRatio)
+    function openPositionHelper(address user, uint256 amount, uint16 leverageRatio)
         internal
         returns (uint256 positionId)
     {
@@ -648,9 +677,9 @@ contract LeveragedVaultFactoryTest is Test {
         vm.prank(user);
         positionId = testVault.requestLeveragePosition(amount, leverageRatio);
 
-        // Step 2: Get the broker request ID and process it
-        bytes32 requestId = testVault.positionToRequestId(positionId);
-        primeBroker.processRequest(requestId);
+        // Step 2: The broker automatically created a request, now process it
+        // We'll just call processAllPendingRequests which should approve and execute
+        primeBroker.processAllPendingRequests();
 
         // Step 3: Execute the approved position
         vm.prank(user);
@@ -672,15 +701,16 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 depositAmount = 10_000e6; // 10k USDC
         uint256 leverageRatio = 150; // 1.5x
 
-        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
         // Check position was created
-        LeveragedVaultImplementation.UserPosition memory position =
+        (LeveragedVaultImplementation.Position memory position,
+         LeveragedVaultImplementation.ExecutedPositionData memory executedData) =
             testVault.getPosition(positionId);
         assertEq(position.user, alice);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
-        assertTrue(position.state == LeveragedVaultImplementation.PositionState.Executed);
+        assertTrue(position.state == uint8(LeveragedVaultImplementation.PositionState.Executed));
 
         // Check synthetic tokens were minted
         assertTrue(syntheticToken.balanceOf(alice) > 0);
@@ -698,14 +728,15 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 depositAmount = 20_000e6; // 20k USDC
         uint256 leverageRatio = 300; // 3x
 
-        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
-        LeveragedVaultImplementation.UserPosition memory position =
+        (LeveragedVaultImplementation.Position memory position,
+         LeveragedVaultImplementation.ExecutedPositionData memory executedData) =
             testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
 
         // Check that more was borrowed for higher leverage
-        assertTrue(position.borrowedAmount > (depositAmount * leverageRatio) / 300); // Should be significant
+        assertTrue(executedData.borrowedAmount > (depositAmount * leverageRatio) / 300); // Should be significant
 
         // Check loops calculation
         // 3x leverage should require 2 loops (internal calculation)
@@ -715,9 +746,9 @@ contract LeveragedVaultFactoryTest is Test {
         uint256 depositAmount = 5_000e6; // 5k USDC
         uint256 leverageRatio = 500; // 5x (max)
 
-        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
-        LeveragedVaultImplementation.UserPosition memory position =
+        (LeveragedVaultImplementation.Position memory position,) =
             testVault.getPosition(positionId);
         assertEq(position.leverageRatio, leverageRatio);
 
@@ -734,21 +765,21 @@ contract LeveragedVaultFactoryTest is Test {
 
         // Check both positions are executed (active)
         assertEq(
-            uint256(testVault.getPosition(positionId1).state),
+            uint256(getPositionState(positionId1)),
             uint256(LeveragedVaultImplementation.PositionState.Executed)
         );
         assertEq(
-            uint256(testVault.getPosition(positionId2).state),
+            uint256(getPositionState(positionId2)),
             uint256(LeveragedVaultImplementation.PositionState.Executed)
         );
 
         // Check both positions have Executed state
         assertEq(
-            uint256(testVault.getPosition(positionId1).state),
+            uint256(getPositionState(positionId1)),
             uint256(LeveragedVaultImplementation.PositionState.Executed)
         );
         assertEq(
-            uint256(testVault.getPosition(positionId2).state),
+            uint256(getPositionState(positionId2)),
             uint256(LeveragedVaultImplementation.PositionState.Executed)
         );
 
@@ -767,7 +798,7 @@ contract LeveragedVaultFactoryTest is Test {
 
         // Try to close immediately (should fail)
         vm.prank(alice);
-        vm.expectRevert("Position still locked");
+        vm.expectRevert(PositionStillLocked.selector);
         testVault.closePosition(positionId);
 
         // Fast forward past lock period
@@ -780,7 +811,7 @@ contract LeveragedVaultFactoryTest is Test {
 
         // Check position is closed
         assertEq(
-            uint256(testVault.getPosition(positionId).state),
+            uint256(getPositionState(positionId)),
             uint256(LeveragedVaultImplementation.PositionState.Completed)
         );
 
@@ -870,15 +901,15 @@ contract LeveragedVaultFactoryTest is Test {
         vm.startPrank(alice);
 
         // Too low leverage
-        vm.expectRevert("Invalid leverage ratio");
+        vm.expectRevert(InvalidLeverageRatio.selector);
         testVault.requestLeveragePosition(depositAmount, 100); // 1x
 
         // Too high leverage
-        vm.expectRevert("Invalid leverage ratio");
+        vm.expectRevert(InvalidLeverageRatio.selector);
         testVault.requestLeveragePosition(depositAmount, 600); // 6x
 
         // Invalid increment (not 0.5x increment)
-        vm.expectRevert("Invalid leverage ratio");
+        vm.expectRevert(InvalidLeverageRatio.selector);
         testVault.requestLeveragePosition(depositAmount, 175); // 1.75x
 
         vm.stopPrank();
@@ -900,16 +931,21 @@ contract LeveragedVaultFactoryTest is Test {
         LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation
             .VaultConfig({
             depositToken: usdc,
-            primeBroker: primeBroker,
-            morpho: morpho,
-            syntheticToken: newSyntheticToken,
-            fundToken: address(newFund),
-            morphoMarket: newMorphoMarket,
             managementFee: 300,
             performanceFee: 1500,
-            minLockPeriod: 14 days,
-            feeRecipient: treasury,
             maxLeverage: 400,
+            minLockPeriod: uint64(14 days),
+            primeBroker: primeBroker,
+            _reserved1: 0,
+            morpho: morpho,
+            _reserved2: 0,
+            syntheticToken: newSyntheticToken,
+            _reserved3: 0,
+            fundToken: address(newFund),
+            _reserved4: 0,
+            feeRecipient: treasury,
+            _reserved5: 0,
+            morphoMarket: newMorphoMarket,
             vaultName: "Second Vault",
             vaultSymbol: "SV"
         });
@@ -933,7 +969,7 @@ contract LeveragedVaultFactoryTest is Test {
         // Try to close as Bob (should fail)
         vm.warp(block.timestamp + 8 days);
         vm.prank(bob);
-        vm.expectRevert("Not position owner");
+        vm.expectRevert(NotPositionOwner.selector);
         testVault.closePosition(positionId);
     }
 
@@ -999,16 +1035,21 @@ contract LeveragedVaultFactoryTest is Test {
         LeveragedVaultImplementation.VaultConfig memory newConfig = LeveragedVaultImplementation
             .VaultConfig({
             depositToken: usdc,
-            primeBroker: primeBroker,
-            morpho: morpho,
-            syntheticToken: syntheticToken,
-            fundToken: address(fundToken),
-            morphoMarket: updatedMarket,
             managementFee: 300, // Changed to 3%
             performanceFee: 1500, // Changed to 15%
-            minLockPeriod: 14 days, // Changed to 2 weeks
-            feeRecipient: treasury,
             maxLeverage: 400, // Changed to 4x max
+            minLockPeriod: uint64(14 days), // Changed to 2 weeks
+            primeBroker: primeBroker,
+            _reserved1: 0,
+            morpho: morpho,
+            _reserved2: 0,
+            syntheticToken: syntheticToken,
+            _reserved3: 0,
+            fundToken: address(fundToken),
+            _reserved4: 0,
+            feeRecipient: treasury,
+            _reserved5: 0,
+            morphoMarket: updatedMarket,
             vaultName: "Updated Test Vault",
             vaultSymbol: "UTV"
         });
@@ -1042,14 +1083,14 @@ contract LeveragedVaultFactoryTest is Test {
         vm.prank(alice);
         usdc.approve(address(testVault), depositAmount);
 
-        uint256 positionId = openPositionHelper(alice, depositAmount, leverageRatio);
+        uint256 positionId = openPositionHelper(alice, depositAmount, uint16(leverageRatio));
 
         // Verify position was created correctly
-        LeveragedVaultImplementation.UserPosition memory position =
+        (LeveragedVaultImplementation.Position memory position,) =
             testVault.getPosition(positionId);
         assertEq(position.depositAmount, depositAmount);
         assertEq(position.leverageRatio, leverageRatio);
-        assertTrue(position.state == LeveragedVaultImplementation.PositionState.Executed);
+        assertTrue(position.state == uint8(LeveragedVaultImplementation.PositionState.Executed));
     }
 
     function testStressTestMultipleUsers() public {
@@ -1070,7 +1111,7 @@ contract LeveragedVaultFactoryTest is Test {
             if (leverage > 500) leverage = 500;
 
             // Use openPositionHelper to complete the full async flow
-            positionIds[i] = openPositionHelper(users[i], deposit, leverage);
+            positionIds[i] = openPositionHelper(users[i], deposit, uint16(leverage));
         }
 
         // Check vault state after all positions are executed
@@ -1080,11 +1121,11 @@ contract LeveragedVaultFactoryTest is Test {
         // Verify all positions are executed
         for (uint256 i = 0; i < 10; i++) {
             assertEq(
-                uint256(testVault.getPosition(positionIds[i]).state),
+                uint256(getPositionState(positionIds[i])),
                 uint256(LeveragedVaultImplementation.PositionState.Executed)
             );
             assertEq(
-                uint256(testVault.getPosition(positionIds[i]).state),
+                uint256(getPositionState(positionIds[i])),
                 uint256(LeveragedVaultImplementation.PositionState.Executed)
             );
         }
@@ -1103,7 +1144,7 @@ contract LeveragedVaultFactoryTest is Test {
         // All positions should be closed
         for (uint256 i = 0; i < 10; i++) {
             assertEq(
-                uint256(testVault.getPosition(positionIds[i]).state),
+                uint256(getPositionState(positionIds[i])),
                 uint256(LeveragedVaultImplementation.PositionState.Completed)
             );
         }
@@ -1129,16 +1170,21 @@ contract LeveragedVaultFactoryTest is Test {
             LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation
                 .VaultConfig({
                 depositToken: usdc,
-                primeBroker: primeBroker,
-                morpho: morpho,
-                syntheticToken: newToken,
-                fundToken: address(newFund),
-                morphoMarket: newMarket,
-                managementFee: 200 + (i * 100),
+                managementFee: uint16(200 + (i * 100)),
                 performanceFee: 2000,
-                minLockPeriod: 7 days,
-                feeRecipient: treasury,
                 maxLeverage: 500,
+                minLockPeriod: uint64(7 days),
+                primeBroker: primeBroker,
+                _reserved1: 0,
+                morpho: morpho,
+                _reserved2: 0,
+                syntheticToken: newToken,
+                _reserved3: 0,
+                fundToken: address(newFund),
+                _reserved4: 0,
+                feeRecipient: treasury,
+                _reserved5: 0,
+                morphoMarket: newMarket,
                 vaultName: string(abi.encodePacked("Vault ", i)),
                 vaultSymbol: string(abi.encodePacked("V", i))
             });

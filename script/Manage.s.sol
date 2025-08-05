@@ -75,7 +75,8 @@ contract Manage is Script {
         // For this demo, we'll check positions 1-10
         for (uint256 i = 1; i <= 10; i++) {
             try LeveragedVaultImplementation(vault).getPosition(i) returns (
-                LeveragedVaultImplementation.UserPosition memory position
+                LeveragedVaultImplementation.Position memory position,
+                LeveragedVaultImplementation.ExecutedPositionData memory executedData
             ) {
                 if (position.user != address(0)) {
                     printPositionSummary(vault, i, position);
@@ -90,7 +91,7 @@ contract Manage is Script {
     function printPositionSummary(
         address vault,
         uint256 positionId,
-        LeveragedVaultImplementation.UserPosition memory position
+        LeveragedVaultImplementation.Position memory position
     ) internal view {
         (uint256 currentValue, int256 pnl) =
             LeveragedVaultImplementation(vault).getPositionValue(positionId);
@@ -225,16 +226,21 @@ contract Manage is Script {
             LeveragedVaultImplementation.VaultConfig memory config = LeveragedVaultImplementation
                 .VaultConfig({
                 depositToken: IERC20(usdc),
-                primeBroker: IPrimeBroker(primeBroker),
-                morpho: IMorpho(vm.envAddress("MORPHO_BASE_TESTNET")),
-                syntheticToken: IERC3643(syntheticToken),
-                fundToken: mockFund,
-                morphoMarket: morphoMarket,
                 managementFee: 200,
                 performanceFee: 2000,
-                minLockPeriod: 7 days,
-                feeRecipient: deployer,
                 maxLeverage: 500,
+                minLockPeriod: uint64(7 days),
+                primeBroker: IPrimeBroker(primeBroker),
+                _reserved1: 0,
+                morpho: IMorpho(vm.envAddress("MORPHO_BASE_TESTNET")),
+                _reserved2: 0,
+                syntheticToken: IERC3643(syntheticToken),
+                _reserved3: 0,
+                fundToken: mockFund,
+                _reserved4: 0,
+                feeRecipient: deployer,
+                _reserved5: 0,
+                morphoMarket: morphoMarket,
                 vaultName: string(abi.encodePacked("Test Vault ", vm.toString(i + 1))),
                 vaultSymbol: string(abi.encodePacked("TV", vm.toString(i + 1)))
             });

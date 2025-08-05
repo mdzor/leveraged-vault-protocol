@@ -27,7 +27,8 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
     mapping(bytes32 => LeverageRequest) public requests;
     mapping(address => uint256) public suppliedAssets;
     mapping(address => uint256) public borrowedAssets;
-
+    
+    bytes32[] public allRequestIds;
     uint256 private requestNonce;
     uint256 public constant HEALTH_FACTOR_PRECISION = 1e18;
     uint256 public defaultHealthFactor = 2e18; // 200% health factor
@@ -120,6 +121,7 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
             isApproved: false
         });
 
+        allRequestIds.push(requestId);
         emit LeverageRequested(requestId, user, leverageAmount);
         return requestId;
     }
@@ -217,8 +219,40 @@ contract MockPrimeBroker is Ownable, IPrimeBroker {
      * @dev Get pending requests (for admin interface)
      */
     function getPendingRequests() external view returns (bytes32[] memory) {
-        // In a real implementation, you'd track all request IDs
-        // For mock, we'll return empty array
-        return new bytes32[](0);
+        uint256 pendingCount = 0;
+        
+        // Count pending requests
+        for (uint256 i = 0; i < allRequestIds.length; i++) {
+            if (!requests[allRequestIds[i]].isProcessed) {
+                pendingCount++;
+            }
+        }
+        
+        // Create array of pending request IDs
+        bytes32[] memory pendingRequests = new bytes32[](pendingCount);
+        uint256 currentIndex = 0;
+        
+        for (uint256 i = 0; i < allRequestIds.length; i++) {
+            if (!requests[allRequestIds[i]].isProcessed) {
+                pendingRequests[currentIndex] = allRequestIds[i];
+                currentIndex++;
+            }
+        }
+        
+        return pendingRequests;
+    }
+
+    /**
+     * @dev Get all requests (for admin interface)
+     */
+    function getAllRequests() external view returns (bytes32[] memory) {
+        return allRequestIds;
+    }
+
+    /**
+     * @dev Get total number of requests
+     */
+    function getTotalRequestCount() external view returns (uint256) {
+        return allRequestIds.length;
     }
 }

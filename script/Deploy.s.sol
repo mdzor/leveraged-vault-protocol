@@ -16,9 +16,11 @@ import "./mocks/MockPrimeBroker.sol";
  * @dev Comprehensive deployment script for Base testnet
  */
 contract Deploy is Script {
-    // Base testnet addresses
+    // Base network addresses
     address constant USDC_BASE_TESTNET = 0x036CbD53842c5426634e7929541eC2318f3dCF7e; // Base testnet USDC
-    address constant MORPHO_BASE_TESTNET = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb; // Morpho Blue on Base
+    address constant USDC_BASE_MAINNET = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913; // Base mainnet USDC
+    address constant MORPHO_BASE_TESTNET = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb; // Morpho Blue on Base testnet
+    address constant MORPHO_BASE_MAINNET = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb; // Morpho Blue on Base mainnet
 
     // Deployment configuration
     struct DeployConfig {
@@ -86,17 +88,24 @@ contract Deploy is Script {
 
         DeployedContracts memory contracts;
 
-        // Use existing USDC on Base testnet or deploy mock
-        contracts.usdc = USDC_BASE_TESTNET;
-        if (contracts.usdc.code.length == 0) {
-            console.log("USDC not found, deploying mock...");
+        // Check if we're on testnet (chain ID 84532) and deploy mock USDC for testing
+        if (block.chainid == 84532) {
+            console.log("Base testnet detected - deploying mock USDC for testing...");
             contracts.usdc = address(new MockUSDC());
             MockUSDC(contracts.usdc).mint(deployer, 1000000e6); // 1M USDC for testing
+        } else {
+            // Use existing USDC on mainnet
+            contracts.usdc = USDC_BASE_MAINNET;
+            console.log("Using existing USDC on mainnet");
         }
         console.log("USDC:", contracts.usdc);
 
-        // Use existing Morpho on Base testnet
-        contracts.morpho = MORPHO_BASE_TESTNET;
+        // Use appropriate Morpho address based on network
+        if (block.chainid == 84532) {
+            contracts.morpho = MORPHO_BASE_TESTNET;
+        } else {
+            contracts.morpho = MORPHO_BASE_MAINNET;
+        }
         console.log("Morpho:", contracts.morpho);
 
         // Deploy mock ERC3643 fund
@@ -149,16 +158,21 @@ contract Deploy is Script {
         LeveragedVaultImplementation.VaultConfig memory vaultConfig = LeveragedVaultImplementation
             .VaultConfig({
             depositToken: IERC20(contracts.usdc),
+            managementFee: uint16(config.managementFee),
+            performanceFee: uint16(config.performanceFee),
+            maxLeverage: uint16(config.maxLeverage),
+            minLockPeriod: uint64(config.minLockPeriod),
             primeBroker: IPrimeBroker(contracts.primeBroker),
+            _reserved1: 0,
             morpho: IMorpho(contracts.morpho),
+            _reserved2: 0,
             syntheticToken: IERC3643(contracts.syntheticToken),
+            _reserved3: 0,
             fundToken: contracts.mockFund,
-            morphoMarket: morphoMarket,
-            managementFee: config.managementFee,
-            performanceFee: config.performanceFee,
-            minLockPeriod: config.minLockPeriod,
+            _reserved4: 0,
             feeRecipient: deployer,
-            maxLeverage: config.maxLeverage,
+            _reserved5: 0,
+            morphoMarket: morphoMarket,
             vaultName: config.vaultName,
             vaultSymbol: config.vaultSymbol
         });
